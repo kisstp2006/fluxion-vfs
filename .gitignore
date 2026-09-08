@@ -1,0 +1,54 @@
+# Everything `zig build` produces: the install prefix (the demo binaries, and
+# the docs from `zig build docs`) and the local build cache. Both are derived
+# from the source in this repo, and the cache is worse than stale elsewhere -
+# it holds absolute paths from this checkout and objects for this toolchain,
+# so it is wrong on another machine before it is even out of date.
+zig-out/
+.zig-cache/
+# What that cache was called before Zig 0.13, in case an older toolchain runs.
+zig-cache/
+
+# Where `zig fetch` puts a dependency's source for this checkout. Derived
+# from the url and hash in build.zig.zon, and re-fetched from those, so it
+# is the package cache rather than anything this repo owns.
+zig-pkg/
+
+# Ad-hoc builds that bypass `zig build` - `zig build-exe`, `zig build-lib`,
+# `zig test some_file.zig` - drop their output next to the source instead.
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.obj
+*.o
+*.lib
+*.a
+*.dll
+*.so
+*.so.*
+*.dylib
+*.wasm
+
+# What a run that ended badly leaves behind. Large, machine-specific, and
+# worth nothing once the bug it came from is fixed.
+core
+core.*
+*.stackdump
+vgcore.*
+
+# Editor and tooling leavings. `.cache/` is clangd's index, which grows to
+# tens of megabytes and is rebuilt from the source anyway.
+.vscode/
+.idea/
+.vs/
+.zed/
+.cache/
+*.swp
+*.swo
+*~
+
+# OS leavings.
+.DS_Store
+._*
+Thumbs.db
+desktop.ini

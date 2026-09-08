@@ -1,0 +1,4 @@
+# Zig tooling normalises to LF: `zig fmt --check` fails on CRLF source, and
+# core.autocrlf=true would otherwise hand a fresh Windows clone CRLF files.
+*.zig text eol=lf
+*.zon text eol=lf

@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
+.{
+    .name = .fluxion_vfs,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x258b9ff295ad612f,
+    .dependencies = .{
+        .fluxion_text = .{
+            .url = "git+https://github.com/kisstp2006/fluxion-text#5d87f1578401d35c0b9881d2c678ef56c4ceccd4",
+            .hash = "fluxion_text-0.1.0-cIhfioG2AgAJJ9hB0dOMWhHvk6ConZmD0OTreG41NoLX",
+        },
+        .fluxion_hash = .{
+            .url = "git+https://github.com/kisstp2006/fluxion-hash#3260ac0d478e025a143e2ef9094c1bf72a932868",
+            .hash = "fluxion_hash-0.1.0-Zu520_IkAQCn0T4xz2CCSD724jkXcbzZBb_dFirBrjS2",
+        },
+        .fluxion_data = .{
+            .url = "git+https://github.com/kisstp2006/fluxion-data#af3df0b00b18e27c852fbe799a7d18247eb9e317",
+            .hash = "fluxion_data-0.1.0-kueVIuEGAQA06cHbAl1uO9C88tmSP2VJOV_AaLryntRR",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "README.md",
+    },
+}
