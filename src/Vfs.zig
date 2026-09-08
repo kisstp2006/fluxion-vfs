@@ -283,7 +283,7 @@ pub fn write(self: *Vfs, io: Io, path: []const u8, bytes: []const u8) Error!void
     while (i > 0) {
         i -= 1;
         const mount_at = self.mounts.items[i];
-        if (!mount_at.source.writable()) continue;
+        if (!mount_at.source.writable) continue;
         const under = beneath(mount_at.prefix, name) orelse continue;
         return mount_at.source.write(io, under, bytes);
     }
@@ -299,7 +299,7 @@ pub fn remove(self: *Vfs, io: Io, path: []const u8) Error!void {
     while (i > 0) {
         i -= 1;
         const mount_at = self.mounts.items[i];
-        if (!mount_at.source.writable()) continue;
+        if (!mount_at.source.writable) continue;
         const under = beneath(mount_at.prefix, name) orelse continue;
         return mount_at.source.remove(io, under) catch |err| switch (err) {
             error.FileNotFound => continue,

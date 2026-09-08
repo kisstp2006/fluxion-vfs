@@ -20,6 +20,13 @@ const Source = @This();
 
 ptr: *anyopaque,
 vtable: *const VTable,
+/// Whether `write` and `remove` will do anything.
+///
+/// A field rather than a question for the vtable, because it is a property of
+/// this particular mount and not of the kind of source it is: two directory
+/// sources differ on it, and `Vfs.write` has to know which is which before it
+/// tries one.
+writable: bool = false,
 
 /// What a source can say about a path that is in it.
 pub const Stat = struct {
@@ -49,8 +56,8 @@ pub const Error = error{
     /// container version from the future, or an index whose schema has moved.
     UnsupportedPack,
 } || Io.File.OpenError ||
-    Io.File.ReadError ||
-    Io.File.WriteError ||
+    Io.File.ReadPositionalError ||
+    Io.File.WritePositionalError ||
     Io.Dir.StatFileError ||
     Io.Dir.DeleteFileError ||
     Io.Dir.ReadFileAllocError ||
@@ -75,8 +82,8 @@ pub const VTable = struct {
     list: *const fn (ptr: *anyopaque, io: Io, glob: []const u8, into: *Listing) Error!void,
 
     /// Put `bytes` at `path`, making whatever directories it needs. Null for
-    /// a read-only source, which is what makes `Vfs.write` able to say
-    /// `error.ReadOnly` without trying.
+    /// a kind of source that can never be written to, whatever its options -
+    /// which a pack is. See the `writable` field for the per-mount answer.
     write: ?*const fn (ptr: *anyopaque, io: Io, path: []const u8, bytes: []const u8) Error!void = null,
 
     /// Take `path` out. Null for a read-only source.
@@ -101,10 +108,6 @@ pub fn read(self: Source, io: Io, gpa: Allocator, path: []const u8, limit: Io.Li
 
 pub fn list(self: Source, io: Io, glob: []const u8, into: *Listing) Error!void {
     return self.vtable.list(self.ptr, io, glob, into);
-}
-
-pub fn writable(self: Source) bool {
-    return self.vtable.write != null;
 }
 
 pub fn write(self: Source, io: Io, path: []const u8, bytes: []const u8) Error!void {

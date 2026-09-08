@@ -393,10 +393,7 @@ fn checkEntries(all: []const Entry, blobs_end: u64) Error!void {
 }
 
 fn readExactly(file: Io.File, io: Io, into: []u8, at: u64) Error!void {
-    const got = file.readPositionalAll(io, into, at) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.Corrupt,
-    };
+    const got = try file.readPositionalAll(io, into, at);
     if (got != into.len) return error.Corrupt;
 }
 
@@ -525,13 +522,13 @@ fn deflate(gpa: Allocator, bytes: []const u8) Allocator.Error!?[]u8 {
     const window = try gpa.alloc(u8, std.compress.flate.max_window_len);
     defer gpa.free(window);
 
-    var compress: std.compress.flate.Compress = .init(&sink, window, .raw, .default) catch return null;
+    var compress = std.compress.flate.Compress.init(&sink, window, .raw, std.compress.flate.Compress.Options.default) catch return null;
     compress.writer.writeAll(bytes) catch return null;
     compress.finish() catch return null;
 
     const written = sink.buffered();
     if (written.len >= bytes.len) return null;
-    return gpa.dupe(u8, written);
+    return try gpa.dupe(u8, written);
 }
 
 /// Build a whole pack into fresh memory, for a caller with the entries to

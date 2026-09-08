@@ -68,7 +68,7 @@ pub fn close(self: *Dir, io: Io) void {
 
 /// The `Source` view of this directory. The pointer must outlive the source.
 pub fn source(self: *Dir) Source {
-    return .{ .ptr = self, .vtable = &vtable };
+    return .{ .ptr = self, .vtable = &vtable, .writable = self.options.writable };
 }
 
 const vtable: Source.VTable = .{
@@ -84,7 +84,7 @@ const vtable: Source.VTable = .{
 /// struct itself. What `Vfs.mountDir` hands out, and what a caller who holds
 /// its own `Dir` must not use.
 pub fn owning(self: *Dir) Source {
-    return .{ .ptr = self, .vtable = &owning_vtable };
+    return .{ .ptr = self, .vtable = &owning_vtable, .writable = self.options.writable };
 }
 
 const owning_vtable: Source.VTable = blk: {
@@ -132,7 +132,9 @@ fn readPath(
     if (self.options.verify_case and !try self.caseMatches(io, path)) return error.FileNotFound;
 
     return self.handle.readFileAlloc(io, path, gpa, limit) catch |err| switch (err) {
-        error.NotDir, error.BadPathName, error.NameTooLong => error.FileNotFound,
+        // A directory is not an asset, and neither is a path that could not
+        // name one: all of them are the same "not here" a lookup moves past.
+        error.NotDir, error.IsDir, error.BadPathName, error.NameTooLong => error.FileNotFound,
         error.StreamTooLong => error.TooLarge,
         else => |remaining| remaining,
     };

@@ -181,7 +181,7 @@ pub fn poll(self: *Watch, files: *Vfs, io: Io) Error![]const Change {
     self.retired.clearRetainingCapacity();
     self.changes.clearRetainingCapacity();
 
-    const now = Io.Timestamp.now(io, .monotonic).nanoseconds;
+    const now = Io.Timestamp.now(io, .awake).nanoseconds;
 
     try self.scanGlobs(files, io);
 
