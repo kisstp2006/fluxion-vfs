@@ -49,6 +49,8 @@ const Io = std.Io;
 const hashing = @import("fluxion_hash");
 const fxdata = @import("fluxion_data");
 
+const Jobs = @import("fluxion_jobs").Jobs;
+
 const Map = @import("Map.zig");
 const Source = @import("Source.zig");
 const Stream = @import("Stream.zig");
@@ -463,6 +465,12 @@ fn readExactly(file: Io.File, io: Io, into: []u8, at: u64) Error!void {
 // Building one
 // -------------------------------------------------------------------------
 
+/// How many entries `Builder.addAll` prepares at once, and how many bytes of
+/// input those may cover. Between them they bound what a parallel build holds
+/// beyond the builder itself.
+const max_batch_items = 256;
+const max_batch_bytes = 64 << 20;
+
 /// Writes a pack, one entry at a time.
 ///
 /// The blobs go out as they arrive, so the memory this needs is the index
@@ -537,31 +545,125 @@ pub const Builder = struct {
         self.* = undefined;
     }
 
+    /// One entry to add. What `addAll` takes.
+    pub const Item = struct {
+        path: []const u8,
+        bytes: []const u8,
+        how: How = .auto,
+    };
+
+    /// Everything about an entry that can be worked out without touching the
+    /// builder: its checksum, and its deflated form when deflating helped.
+    ///
+    /// Separated out because it is all of the expensive part and none of the
+    /// shared part, which is what lets `addAll` do it on several threads.
+    const Prepared = struct {
+        checksum: u32 = 0,
+        /// Owned, and freed once written. Null when the entry is stored as it
+        /// is - because it was asked for, or because deflating did not pay.
+        deflated: ?[]u8 = null,
+        /// The preparation could not get memory. A job cannot return an
+        /// error, so it says so here.
+        out_of_memory: bool = false,
+    };
+
+    /// Checksum `bytes`, and deflate them if that is worth doing.
+    ///
+    /// Touches nothing but `result` and the allocator, so any number of these
+    /// may run at once. The allocator must be thread-safe when they do.
+    fn prepare(result: *Prepared, bytes: []const u8, how: How, gpa: Allocator) void {
+        var crc: hashing.Crc32 = .init();
+        crc.update(bytes);
+        result.checksum = crc.final();
+
+        if (how == .store or bytes.len == 0) return;
+        const smaller = deflate(gpa, bytes) catch {
+            result.out_of_memory = true;
+            return;
+        } orelse return;
+
+        // Kept only when it saved enough to pay for the decompression on
+        // every load - unless the caller asked for it whatever it saved.
+        if (how == .deflate or smaller.len + bytes.len / 16 < bytes.len) {
+            result.deflated = smaller;
+        } else {
+            gpa.free(smaller);
+        }
+    }
+
     /// Add `bytes` under `path`, which is normalized on the way in.
     pub fn add(self: *Builder, path: []const u8, bytes: []const u8, how: How) Builder.Error!void {
+        var result: Prepared = .{};
+        prepare(&result, bytes, how, self.gpa);
+        defer if (result.deflated) |owned| self.gpa.free(owned);
+        if (result.out_of_memory) return error.OutOfMemory;
+        return self.record(path, bytes, result);
+    }
+
+    /// Add many entries, preparing them on `jobs` and writing them in order.
+    ///
+    /// Deflating is nearly the whole cost of building a pack, and each
+    /// entry is independent of every other, so this is the one place in this
+    /// library where more cores are more speed. The bytes still go into the
+    /// file in the order they were given: the pack is byte for byte the one
+    /// `add` in a loop would have written.
+    ///
+    /// Entries are prepared in batches, so what this holds beyond the builder
+    /// is one batch of deflated output rather than the whole pack. `gpa` must
+    /// be thread-safe when `jobs` has workers, which the default allocators
+    /// are. A `Jobs` with no workers - a browser build - runs the preparation
+    /// on this thread, and everything else is the same.
+    pub fn addAll(self: *Builder, jobs: *Jobs, items: []const Item) Builder.Error!void {
+        if (items.len == 0) return;
+
+        const results = try self.gpa.alloc(Prepared, @min(items.len, max_batch_items));
+        defer self.gpa.free(results);
+
+        var at: usize = 0;
+        while (at < items.len) {
+            // A batch is bounded by count and by bytes, so one enormous file
+            // in the middle does not decide how much memory this takes.
+            var count: usize = 0;
+            var bytes: usize = 0;
+            while (at + count < items.len and count < results.len) {
+                const size = items[at + count].bytes.len;
+                if (count != 0 and bytes + size > max_batch_bytes) break;
+                bytes += size;
+                count += 1;
+            }
+
+            const batch = items[at..][0..count];
+            for (results[0..count], batch) |*result, item| {
+                result.* = .{};
+                // A scheduler with no room left is not a failure: the work
+                // happens here instead, which is what a scheduler with no
+                // workers does with all of it anyway.
+                _ = jobs.spawn(prepare, .{ result, item.bytes, item.how, self.gpa }) catch {
+                    prepare(result, item.bytes, item.how, self.gpa);
+                };
+            }
+            jobs.waitAll();
+
+            defer for (results[0..count]) |result| {
+                if (result.deflated) |owned| self.gpa.free(owned);
+            };
+            // In order, so the file reads the same however it was built.
+            for (results[0..count], batch) |result, item| {
+                if (result.out_of_memory) return error.OutOfMemory;
+                try self.record(item.path, item.bytes, result);
+            }
+            at += count;
+        }
+    }
+
+    /// The part that touches the builder: name it, remember it, write it.
+    fn record(self: *Builder, path: []const u8, bytes: []const u8, result: Prepared) Builder.Error!void {
         var buf: [vpath.max_len]u8 = undefined;
         const name = try vpath.normalize(&buf, path, .portable);
         if (self.seen.contains(name)) return error.DuplicatePath;
 
-        var crc: hashing.Crc32 = .init();
-        crc.update(bytes);
-
-        var stored: []const u8 = bytes;
-        var compression: Compression = .none;
-        var packed_bytes: ?[]u8 = null;
-        defer if (packed_bytes) |owned| self.gpa.free(owned);
-
-        if (how != .store and bytes.len != 0) {
-            if (try deflate(self.gpa, bytes)) |smaller| {
-                packed_bytes = smaller;
-                const worth_it = how == .deflate or
-                    smaller.len + bytes.len / 16 < bytes.len;
-                if (worth_it) {
-                    stored = smaller;
-                    compression = .flate;
-                }
-            }
-        }
+        const stored: []const u8 = result.deflated orelse bytes;
+        const compression: Compression = if (result.deflated != null) .flate else .none;
 
         const owned_path = try self.gpa.dupe(u8, name);
         errdefer self.gpa.free(owned_path);
@@ -572,7 +674,7 @@ pub const Builder = struct {
             .offset = self.at,
             .stored = stored.len,
             .size = bytes.len,
-            .checksum = crc.final(),
+            .checksum = result.checksum,
             .compression = compression,
         });
 

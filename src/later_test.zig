@@ -16,6 +16,7 @@ const Notify = @import("Notify.zig");
 const Pack = @import("Pack.zig");
 const Vfs = @import("Vfs.zig");
 const Watch = @import("Watch.zig");
+const Jobs = @import("fluxion_jobs").Jobs;
 
 const io = testing.io;
 const gpa = testing.allocator;
@@ -328,4 +329,191 @@ test "a watch with the kernel's help sees the same things" {
     const changes = try watch.poll(&files, io);
     try testing.expectEqual(@as(usize, 1), changes.len);
     try testing.expectEqual(Watch.Change.Kind.changed, changes[0].kind);
+}
+
+// -------------------------------------------------------------------------
+// Building a pack on more than one core
+// -------------------------------------------------------------------------
+
+/// A corpus with something of every kind in it: text that deflates, noise
+/// that does not, an empty entry, and one large enough to matter.
+fn corpus(count: usize) ![]Pack.Builder.Item {
+    const items = try gpa.alloc(Pack.Builder.Item, count);
+    errdefer gpa.free(items);
+
+    var prng: std.Random.DefaultPrng = .init(11);
+    for (items, 0..) |*item, i| {
+        const path = try std.fmt.allocPrint(gpa, "assets/group{d}/file{d}.bin", .{ i % 7, i });
+        var bytes: []u8 = &.{};
+        switch (i % 4) {
+            0 => bytes = try gpa.dupe(u8, compressible),
+            1 => {
+                bytes = try gpa.alloc(u8, 4096);
+                prng.random().bytes(bytes);
+            },
+            2 => bytes = try gpa.dupe(u8, ""),
+            else => {
+                bytes = try gpa.alloc(u8, 20_000);
+                @memset(bytes, @intCast('a' + i % 26));
+            },
+        }
+        item.* = .{ .path = path, .bytes = bytes, .how = if (i % 5 == 0) .store else .auto };
+    }
+    return items;
+}
+
+fn freeCorpus(items: []Pack.Builder.Item) void {
+    for (items) |item| {
+        gpa.free(item.path);
+        gpa.free(item.bytes);
+    }
+    gpa.free(items);
+}
+
+/// Build a pack the plain way, one entry at a time.
+fn buildOneAtATime(items: []const Pack.Builder.Item) ![]u8 {
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var builder: Pack.Builder = try .init(gpa, &out.writer);
+    defer builder.deinit();
+    for (items) |item| try builder.add(item.path, item.bytes, item.how);
+    try builder.finish();
+    return out.toOwnedSlice();
+}
+
+/// Build the same pack through the scheduler.
+fn buildOnJobs(items: []const Pack.Builder.Item, options: Jobs.Options) ![]u8 {
+    var jobs: Jobs = try .init(gpa, options);
+    defer jobs.deinit();
+
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var builder: Pack.Builder = try .init(gpa, &out.writer);
+    defer builder.deinit();
+    try builder.addAll(&jobs, items);
+    try builder.finish();
+    return out.toOwnedSlice();
+}
+
+test "a pack built on several threads is the pack built on one" {
+    // More than one batch, so the batching itself is exercised.
+    const items = try corpus(600);
+    defer freeCorpus(items);
+
+    const sequential = try buildOneAtATime(items);
+    defer gpa.free(sequential);
+
+    // With as many workers as the machine gives.
+    const threaded = try buildOnJobs(items, .{ .io = io, .workers = .auto });
+    defer gpa.free(threaded);
+
+    // And with none, which is what a browser build does.
+    const alone = try buildOnJobs(items, .{ .io = null });
+    defer gpa.free(alone);
+
+    // Byte for byte, all three: same order, same offsets, same compression
+    // decisions, same index.
+    try testing.expectEqualSlices(u8, sequential, threaded);
+    try testing.expectEqualSlices(u8, sequential, alone);
+}
+
+test "everything in a pack built that way comes back out" {
+    const items = try corpus(120);
+    defer freeCorpus(items);
+
+    const built = try buildOnJobs(items, .{ .io = io, .workers = .auto });
+    defer gpa.free(built);
+
+    var pack: Pack = try .fromBytes(gpa, built, .{});
+    defer pack.deinit(io);
+    var source = pack.source();
+
+    try testing.expectEqual(items.len, pack.entries().len);
+    for (items) |item| {
+        const got = try source.read(io, gpa, item.path, one_mb);
+        defer gpa.free(got);
+        try testing.expectEqualSlices(u8, item.bytes, got);
+
+        // `.store` means stored, whatever it would have compressed to.
+        if (item.how == .store) {
+            try testing.expectEqual(Pack.Compression.none, pack.find(item.path).?.compression);
+        }
+    }
+}
+
+test "a duplicate is still refused, and nothing after it is written" {
+    var jobs: Jobs = try .init(gpa, .{ .io = io });
+    defer jobs.deinit();
+
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var builder: Pack.Builder = try .init(gpa, &out.writer);
+    defer builder.deinit();
+
+    try testing.expectError(error.DuplicatePath, builder.addAll(&jobs, &.{
+        .{ .path = "a.txt", .bytes = "one" },
+        .{ .path = "b.txt", .bytes = "two" },
+        .{ .path = "a/../a.txt", .bytes = "one again" },
+        .{ .path = "c.txt", .bytes = "three" },
+    }));
+
+    // The two before the duplicate are in; the one after it is not.
+    try builder.finish();
+    var pack: Pack = try .fromBytes(gpa, out.written(), .{});
+    defer pack.deinit(io);
+    try testing.expectEqual(@as(usize, 2), pack.entries().len);
+    try testing.expect(pack.find("c.txt") == null);
+}
+
+test "adding none of them is not an error" {
+    var jobs: Jobs = try .init(gpa, .{ .io = null });
+    defer jobs.deinit();
+
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var builder: Pack.Builder = try .init(gpa, &out.writer);
+    defer builder.deinit();
+    try builder.addAll(&jobs, &.{});
+    try builder.finish();
+
+    var pack: Pack = try .fromBytes(gpa, out.written(), .{});
+    defer pack.deinit(io);
+    try testing.expectEqual(@as(usize, 0), pack.entries().len);
+}
+
+test "a rebuilt pack can be filled in parallel too" {
+    const old = try Pack.build(gpa, &.{
+        .{ .path = "keep.txt", .bytes = compressible, .how = .deflate },
+        .{ .path = "replace.txt", .bytes = "the old one" },
+    });
+    defer gpa.free(old);
+    var before: Pack = try .fromBytes(gpa, old, .{});
+    defer before.deinit(io);
+
+    var jobs: Jobs = try .init(gpa, .{ .io = io });
+    defer jobs.deinit();
+
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var builder: Pack.Builder = try .initFrom(gpa, &out.writer, &before, io);
+    defer builder.deinit();
+
+    try builder.remove("replace.txt");
+    try builder.addAll(&jobs, &.{
+        .{ .path = "replace.txt", .bytes = "the new one" },
+        .{ .path = "new.txt", .bytes = compressible },
+    });
+    try builder.finish();
+
+    var after: Pack = try .fromBytes(gpa, out.written(), .{});
+    defer after.deinit(io);
+    try testing.expectEqual(@as(usize, 3), after.entries().len);
+
+    var source = after.source();
+    const replaced = try source.read(io, gpa, "replace.txt", one_mb);
+    defer gpa.free(replaced);
+    try testing.expectEqualStrings("the new one", replaced);
+    const carried = try source.read(io, gpa, "keep.txt", one_mb);
+    defer gpa.free(carried);
+    try testing.expectEqualStrings(compressible, carried);
 }

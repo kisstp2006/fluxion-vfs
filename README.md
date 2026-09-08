@@ -6,7 +6,7 @@ One namespace, whatever is behind it. For Zig 0.16.
 | --- | --- |
 | `Vfs` | The mount table, and the verbs: `read`, `open`, `readAsync`, `write`, `list`, `locate`. |
 | `Dir` | A directory on disk, as a source. The only kind that can be written to. |
-| `Pack` | One file holding many, as a source, and the builder that makes or rebuilds one. |
+| `Pack` | One file holding many, as a source, and the builder that makes or rebuilds one, on every core. |
 | `Stream` | An asset read a piece at a time, over whatever it is stored in. |
 | `Map` | A file as memory: `mmap`, or a section object on Windows. |
 | `Watch` | What changed since you last asked. |
@@ -96,6 +96,7 @@ zig build pack -- create assets.fxpk assets
 zig build pack -- update assets.fxpk patch      # carry everything, replace what patch has
 zig build pack -- list assets.fxpk
 zig build pack -- extract assets.fxpk out
+zig build pack -- create assets.fxpk assets --jobs 0   # one thread, for comparison
 ```
 
 A pack is built once by a tool and read many times by a game, which is what
@@ -140,6 +141,26 @@ the only way an uncompressed entry can be handed out as a slice of the file
 with no copy, which is `Pack.slice`. `openFile` keeps the file open, holds the
 index, and reads each entry from where it lies, for a target that cannot map.
 `fromBytes` is for a pack already in memory, `@embedFile`d or otherwise.
+
+**A pack is built on every core.** Deflating is nearly the whole cost of
+building one and each entry is independent of every other, so `Builder.addAll`
+prepares them on a [Fluxion Jobs](https://github.com/kisstp2006/fluxion-jobs)
+scheduler and writes them in order afterwards. The pack is byte for byte the
+one `add` in a loop would have written - the tests check exactly that, against
+both a threaded scheduler and one with no workers at all.
+
+Packing this Zig installation's standard library, 552 files and 16 MB, on an
+eight-core machine:
+
+| | wall time |
+| --- | --- |
+| 1 worker | 0.55 s |
+| 2 workers | 0.38 s |
+| 7 workers | 0.31 s |
+| reading and writing alone, no compression | 0.33 s |
+
+The last row is the point: with the compression spread out, building a pack
+costs what reading the files costs and nothing more.
 
 **Changing a pack is rebuilding it**, and `Builder.initFrom` makes that cheap:
 it starts a new pack from an old one, carries every entry across as it was
@@ -225,18 +246,21 @@ exe_mod.addImport("fluxion_vfs", fluxion.module("fluxion_vfs"));
 const vfs = @import("fluxion_vfs");
 ```
 
-Three dependencies come with it, fetched the same way and needing nothing from
+Four dependencies come with it, fetched the same way and needing nothing from
 you: [Fluxion Text](https://github.com/kisstp2006/fluxion-text) for path
 normalizing and glob matching,
 [Fluxion Hash](https://github.com/kisstp2006/fluxion-hash) for the CRC-32 on
-every pack entry, and
+every pack entry,
 [Fluxion Data](https://github.com/kisstp2006/fluxion-data) for the pack index
-and the schema fingerprint that dates it.
+and the schema fingerprint that dates it, and
+[Fluxion Jobs](https://github.com/kisstp2006/fluxion-jobs) for building a pack
+on more than one core. Nothing but `Builder.addAll` touches the last one, and
+a scheduler with no workers makes it a plain loop.
 
 ## Where it sits
 
 The third tier of the Fluxion licence ladder: `BSD-2-Clause`, built on one
-tier-one library and two tier-two ones. That tier asks one thing a binary
+tier-one library and three tier-two ones. That tier asks one thing a binary
 built from it did not before - the copyright notice reproduced in the
 documentation or about-box of what you ship.
 
@@ -248,7 +272,9 @@ refuse, shadowing between mounts, a listing that is a set rather than a
 concatenation, a save that has nowhere to go, a stream read seven bytes at a
 time from every kind of place, a mapped entry checked to be inside the
 mapping, a rebuilt pack whose carried entry kept its stored size and checksum,
-and a watch that hears about a write through the kernel.
+a pack of six hundred entries built three ways - one at a time, on every core,
+and on none - and compared byte for byte, and a watch that hears about a write
+through the kernel.
 
 The pack tests are mostly about what a pack is not - a wrong magic, a version
 from the future, a flag this build does not know, an index offset past the end

@@ -4,7 +4,7 @@
 //!
 //!   `Vfs`     the mount table, and the verbs: read, write, list, locate
 //!   `Dir`     a directory on disk, as a source
-//!   `Pack`    one file holding many, as a source, and the tool to build one
+//!   `Pack`    one file holding many, as a source, and the builder that makes one
 //!   `Stream`  an asset read a piece at a time
 //!   `Watch`   what changed since you last asked
 //!   `Notify`  the kernel's word on whether anything did, so a poll can be skipped
@@ -58,6 +58,10 @@ pub const Source = @import("Source.zig");
 pub const Stream = @import("Stream.zig");
 pub const Map = @import("Map.zig");
 pub const vpath = @import("vpath.zig");
+
+/// The scheduler a parallel pack build runs on, re-exported so a caller need
+/// not depend on it by name. See `Pack.Builder.addAll`.
+pub const Jobs = @import("fluxion_jobs").Jobs;
 
 /// Everything a mount table can answer with. See `Source.Error` and
 /// `vpath.Error`.

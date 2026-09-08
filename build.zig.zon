@@ -18,6 +18,10 @@
             .url = "git+https://github.com/kisstp2006/fluxion-data#af3df0b00b18e27c852fbe799a7d18247eb9e317",
             .hash = "fluxion_data-0.1.0-kueVIuEGAQA06cHbAl1uO9C88tmSP2VJOV_AaLryntRR",
         },
+        .fluxion_jobs = .{
+            .url = "git+https://github.com/kisstp2006/fluxion-jobs#e064fb3129f9324b139d7ecbcf75cbd99787dad9",
+            .hash = "fluxion_jobs-0.1.0-FBQYG6HWAAD3RZ_geJ6O5O0UmfH666aT_-DuMCVqJiN1",
+        },
     },
     .paths = .{
         "build.zig",

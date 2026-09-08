@@ -32,6 +32,9 @@ const Options = struct {
     /// Store everything as it is, for a pack meant to be mapped and read
     /// without a decompressor.
     store: bool = false,
+    /// How many worker threads compress with. Null is one per spare core;
+    /// zero is this thread alone, which is what a browser build has.
+    jobs: ?u32 = null,
 
     const Command = enum { create, update, list, extract };
 
@@ -51,6 +54,10 @@ const Options = struct {
                 i += 1;
             } else if (std.mem.eql(u8, argument, "--store")) {
                 self.store = true;
+            } else if (std.mem.eql(u8, argument, "--jobs")) {
+                if (i + 1 >= arguments.len) return null;
+                self.jobs = std.fmt.parseInt(u32, arguments[i + 1], 10) catch return null;
+                i += 1;
             } else if (std.mem.startsWith(u8, argument, "-")) {
                 return null;
             } else if (self.directory.len == 0) {
@@ -96,8 +103,89 @@ fn usage(out: *Io.Writer) !void {
         \\
         \\  --glob <pattern>   only paths matching it, `**` spanning components
         \\  --store            no compression, for a pack meant to be mapped
+        \\  --jobs <n>         compress on n threads; 0 for this one alone
         \\
     );
+}
+
+// -------------------------------------------------------------------------
+// Feeding the builder
+// -------------------------------------------------------------------------
+
+/// How much is read from disk and compressed at a time. Bounded so that
+/// packing a directory of any size costs the same memory as packing a small
+/// one.
+const batch_items = 256;
+const batch_bytes = 64 << 20;
+
+/// Read every path and hand it to `builder`, a batch at a time, compressing
+/// each batch across `jobs`.
+///
+/// The reading is one file at a time and the compressing is all of them at
+/// once, which is the right way round: reading is the disk to answer for and
+/// compressing is the machine to answer for.
+fn feed(
+    gpa: std.mem.Allocator,
+    io: Io,
+    files: *vfs.Vfs,
+    builder: *vfs.Pack.Builder,
+    jobs: *vfs.Jobs,
+    paths: []const []const u8,
+    options: Options,
+    replaced: ?*usize,
+    old_pack: ?*const vfs.Pack,
+) !u64 {
+    var batch: std.ArrayListUnmanaged(vfs.Pack.Builder.Item) = .empty;
+    defer batch.deinit(gpa);
+    var held: usize = 0;
+    var total: u64 = 0;
+
+    for (paths) |path| {
+        const bytes = try files.read(io, gpa, path, .limited(1 << 30));
+        total += bytes.len;
+
+        if (old_pack) |pack| {
+            if (pack.find(path) != null) {
+                // Replacing a carried entry: take the old one out first, or
+                // adding it is a duplicate.
+                try builder.remove(path);
+                if (replaced) |count| count.* += 1;
+            }
+        }
+
+        try batch.append(gpa, .{ .path = path, .bytes = bytes, .how = how(path, options.store) });
+        held += bytes.len;
+
+        if (batch.items.len >= batch_items or held >= batch_bytes) {
+            try flush(gpa, builder, jobs, &batch);
+            held = 0;
+        }
+    }
+    try flush(gpa, builder, jobs, &batch);
+    return total;
+}
+
+fn flush(
+    gpa: std.mem.Allocator,
+    builder: *vfs.Pack.Builder,
+    jobs: *vfs.Jobs,
+    batch: *std.ArrayListUnmanaged(vfs.Pack.Builder.Item),
+) !void {
+    defer {
+        // The paths belong to the listing; only the contents were read here.
+        for (batch.items) |item| gpa.free(item.bytes);
+        batch.clearRetainingCapacity();
+    }
+    try builder.addAll(jobs, batch.items);
+}
+
+fn startJobs(gpa: std.mem.Allocator, io: Io, options: Options) !vfs.Jobs {
+    return vfs.Jobs.init(gpa, .{
+        .io = io,
+        .workers = if (options.jobs) |n| .{ .count = n } else .auto,
+        // One batch in flight, and a little room to spare.
+        .capacity = batch_items + 8,
+    });
 }
 
 // -------------------------------------------------------------------------
@@ -117,6 +205,9 @@ fn create(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, options: Options) !vo
         gpa.free(found);
     }
 
+    var jobs = try startJobs(gpa, io, options);
+    defer jobs.deinit();
+
     var file = try Io.Dir.cwd().createFile(io, options.pack, .{});
     defer file.close(io);
     var buffer: [64 * 1024]u8 = undefined;
@@ -125,13 +216,7 @@ fn create(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, options: Options) !vo
     var builder: vfs.Pack.Builder = try .init(gpa, &writer.interface);
     defer builder.deinit();
 
-    var raw: u64 = 0;
-    for (found) |path| {
-        const bytes = try files.read(io, gpa, path, .limited(1 << 30));
-        defer gpa.free(bytes);
-        raw += bytes.len;
-        try builder.add(path, bytes, how(path, options.store));
-    }
+    const raw = try feed(gpa, io, &files, &builder, &jobs, found, options, null, null);
     try builder.finish();
     try writer.interface.flush();
 
@@ -143,7 +228,7 @@ fn create(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, options: Options) !vo
         size,
     });
     if (raw != 0) try out.print(" ({d}%)", .{size * 100 / raw});
-    try out.writeAll("\n");
+    try out.print(", {d} workers\n", .{jobs.workerCount()});
 }
 
 fn how(path: []const u8, store_everything: bool) vfs.Pack.Builder.How {
@@ -178,6 +263,9 @@ fn update(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, options: Options) !vo
     defer gpa.free(staging);
     var replaced: usize = 0;
     {
+        var jobs = try startJobs(gpa, io, options);
+        defer jobs.deinit();
+
         var file = try Io.Dir.cwd().createFile(io, staging, .{});
         defer file.close(io);
         var buffer: [64 * 1024]u8 = undefined;
@@ -188,13 +276,7 @@ fn update(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, options: Options) !vo
         var builder: vfs.Pack.Builder = try .initFrom(gpa, &writer.interface, &old, io);
         defer builder.deinit();
 
-        for (found) |path| {
-            const bytes = try files.read(io, gpa, path, .limited(1 << 30));
-            defer gpa.free(bytes);
-            if (old.find(path) != null) replaced += 1;
-            try builder.remove(path);
-            try builder.add(path, bytes, how(path, options.store));
-        }
+        _ = try feed(gpa, io, &files, &builder, &jobs, found, options, &replaced, &old);
         try builder.finish();
         try writer.interface.flush();
     }
