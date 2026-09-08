@@ -4,10 +4,13 @@ One namespace, whatever is behind it. For Zig 0.16.
 
 | Module | What it is |
 | --- | --- |
-| `Vfs` | The mount table, and the verbs: `read`, `write`, `list`, `locate`. |
+| `Vfs` | The mount table, and the verbs: `read`, `open`, `readAsync`, `write`, `list`, `locate`. |
 | `Dir` | A directory on disk, as a source. The only kind that can be written to. |
-| `Pack` | One file holding many, as a source, and the builder that makes one. |
+| `Pack` | One file holding many, as a source, and the builder that makes or rebuilds one. |
+| `Stream` | An asset read a piece at a time, over whatever it is stored in. |
+| `Map` | A file as memory: `mmap`, or a section object on Windows. |
 | `Watch` | What changed since you last asked. |
+| `Notify` | The kernel's word on whether anything did, so a poll can be skipped. |
 | `Source` | What any of the above is, so a game can add its own. |
 | `vpath` | What a virtual path is, and what it is not. |
 
@@ -17,8 +20,8 @@ const vfs = @import("fluxion_vfs");
 var files: vfs.Vfs = .init(gpa);
 defer files.deinit(io);
 
-_ = try files.mountPack(io, "", "assets.fxpk", .{});   // what shipped
-_ = try files.mountDir(io, "", "patch", .{});          // what was patched
+_ = try files.mountMappedPack(io, "", "assets.fxpk", .{}); // what shipped
+_ = try files.mountDir(io, "", "patch", .{});               // what was patched
 _ = try files.mountDir(io, "save", "saves", .{ .writable = true });
 
 const bytes = try files.read(io, gpa, "ui/cursor.png", .limited(1 << 20));
@@ -58,17 +61,46 @@ It knows nothing about what is in a file. Decoding a PNG is
 is [Fluxion Data](https://github.com/kisstp2006/fluxion-data); this puts the
 bytes in their hands.
 
+## Three ways to read
+
+```zig
+// Whole. A texture, a sound, a level: most things.
+const bytes = try files.read(io, gpa, "ui/cursor.png", .limited(1 << 20));
+
+// A piece at a time. A video, a music track, anything that should not
+// have to fit in memory to be played.
+var stream = try files.open(io, gpa, "video/intro.ogv");
+defer stream.close(io);
+const chunk = try stream.reader.take(64 * 1024);
+
+// Started now, collected later. A loading screen, a level streaming in.
+var pending = files.readAsync(io, gpa, "levels/two.bin", .limited(1 << 26));
+// ... the frame goes on ...
+const level = try pending.await(io);
+```
+
+A stream is a `std.Io.Reader` over whatever the asset is actually stored in: a
+file, a range of a pack file, a slice of a mapped pack, or the deflated form
+of any of those. The pieces are chained, not copied. The checksum is not
+verified on a stream, because a stream may be read part-way and closed; a
+caller that wants the check reads the whole thing.
+
+`readAsync` is `std.Io`'s own `async`, so what it does is the Io
+implementation's business - a threaded one reads on another thread, a blocking
+one reads right there and `await` finds the answer waiting.
+
 ## Packs
 
 ```bash
 zig build pack -- create assets.fxpk assets
+zig build pack -- update assets.fxpk patch      # carry everything, replace what patch has
 zig build pack -- list assets.fxpk
 zig build pack -- extract assets.fxpk out
 ```
 
-A pack is built once by a tool and never changed, which is what lets it answer
-a lookup with a binary search over an index already in memory, and lets a watch
-skip it entirely.
+A pack is built once by a tool and read many times by a game, which is what
+lets it answer a lookup with a binary search over an index already in memory,
+and lets a watch skip it entirely.
 
 ```
 FXPK                 four bytes, so a file that is not one is noticed at once
@@ -100,11 +132,21 @@ already-compressed extensions without trying.
 
 **Every entry carries a CRC-32 of the bytes that come out**, not of the ones
 that went in, so a pack whose compressor was buggy is caught as well as one
-whose disk is. Checked on every read unless you turn it off.
+whose disk is. Checked on every `read` unless you turn it off.
 
-A pack can be read two ways: `fromBytes` for one already in memory - mapped,
-or `@embedFile`d - and `openFile` for one that keeps the file open, holds only
-the index, and reads each entry from where it lies.
+**A pack can be opened three ways.** `map` maps the file whole and lets the
+kernel page it in as it is touched - the fastest open for a large pack, and
+the only way an uncompressed entry can be handed out as a slice of the file
+with no copy, which is `Pack.slice`. `openFile` keeps the file open, holds the
+index, and reads each entry from where it lies, for a target that cannot map.
+`fromBytes` is for a pack already in memory, `@embedFile`d or otherwise.
+
+**Changing a pack is rebuilding it**, and `Builder.initFrom` makes that cheap:
+it starts a new pack from an old one, carries every entry across as it was
+stored - never decompressed and compressed again - and lets you take some out
+and put some in. What it will not do is pretend to update in place, because
+that would mean moving every blob after the one that changed and rewriting the
+index anyway.
 
 ## Hot reload
 
@@ -131,10 +173,29 @@ the bytes behind a path are different bytes, though nothing on either disk was
 touched. A watch comparing only timestamps would miss it.
 
 **A pack is never polled**, because it reports no modification time: it has
-none. Polling rather than `inotify` or `ReadDirectoryChangesW`, because those
-are three APIs with three failure modes, none of them in `std.Io` yet, and a
-stat of the few hundred files a game has open in development is well under a
-millisecond.
+none.
+
+**The kernel can say when there is nothing to look at.** A poll is a stat per
+watched path, which is under a millisecond for hundreds and not for tens of
+thousands. Give the watch a `Notify` - `ReadDirectoryChangesW` on Windows,
+`inotify` on Linux - and a poll on a quiet frame does nothing at all:
+
+```zig
+var notify: vfs.Notify = .init(gpa);
+defer notify.deinit();
+try notify.add(io, "assets");     // the same path given to mountDir
+watch.useNotify(&notify);
+```
+
+What comes back from the kernel is deliberately one bit - something changed -
+because the two APIs disagree about everything else: what a rename looks like,
+whether a write is one event or three, what happens when the buffer overflows.
+The stats remain the source of truth for what changed and whether it settled;
+the notification only says whether there is anything to look at. A mount
+changing is not something the kernel can know, and is seen anyway, because the
+mount table counts its own changes. On a target with neither API - macOS is
+one, until `std.Io` grows a watch - `Notify.supported` is false and the watch
+polls as before.
 
 ## Install
 
@@ -182,9 +243,12 @@ documentation or about-box of what you ship.
 ## The tests
 
 `vpath` and the listing set are tested where they live, being pure functions.
-Everything else needs a real disk or a real pack, and is in one file: paths a
-mount table must refuse, shadowing between mounts, a listing that is a set
-rather than a concatenation, and a save that has nowhere to go.
+Everything else needs a real disk or a real pack: paths a mount table must
+refuse, shadowing between mounts, a listing that is a set rather than a
+concatenation, a save that has nowhere to go, a stream read seven bytes at a
+time from every kind of place, a mapped entry checked to be inside the
+mapping, a rebuilt pack whose carried entry kept its stored size and checksum,
+and a watch that hears about a write through the kernel.
 
 The pack tests are mostly about what a pack is not - a wrong magic, a version
 from the future, a flag this build does not know, an index offset past the end
@@ -197,8 +261,8 @@ the same change reported once when the wait is over.
 
 ```bash
 zig build test        # run the test suite
-zig build example     # mount a pack, patch it, save, and watch a file change
-zig build pack        # the packer: create, list, extract
+zig build example     # mount a pack, patch it, save, stream, and watch a file change
+zig build pack        # the packer: create, update, list, extract
 zig build docs        # generate API docs into zig-out/docs
 ```
 

@@ -38,8 +38,10 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const Dir = @import("Dir.zig");
+const Map = @import("Map.zig");
 const Pack = @import("Pack.zig");
 const Source = @import("Source.zig");
+const Stream = @import("Stream.zig");
 const vpath = @import("vpath.zig");
 
 const Vfs = @This();
@@ -47,6 +49,9 @@ const Vfs = @This();
 gpa: Allocator,
 mounts: std.ArrayListUnmanaged(Mount) = .empty,
 next_id: u32 = 1,
+/// Goes up on every mount and unmount, so a `Watch` can tell that what is
+/// behind a path may have changed though nothing on any disk did.
+generation: u64 = 0,
 /// How strict to be about the names that go in. See `vpath.Rules`.
 rules: vpath.Rules = .portable,
 
@@ -116,6 +121,7 @@ pub fn mount(self: *Vfs, prefix: []const u8, src: Source) Error!Id {
         .owns_prefix = owns,
     });
     self.next_id += 1;
+    self.generation += 1;
     return id;
 }
 
@@ -151,6 +157,25 @@ pub fn mountPack(
     return self.mount(prefix, holder.owning());
 }
 
+/// Mount a pack file by mapping it into memory. See `Pack.map`.
+///
+/// `error.Unsupported` on a target with no memory mapping, and `mountPack`
+/// works there.
+pub fn mountMappedPack(
+    self: *Vfs,
+    io: Io,
+    prefix: []const u8,
+    path: []const u8,
+    options: Pack.Options,
+) (Error || Map.Error)!Id {
+    const holder = try self.gpa.create(Pack);
+    errdefer self.gpa.destroy(holder);
+    holder.* = try Pack.map(self.gpa, io, path, options);
+    errdefer holder.deinit(io);
+
+    return self.mount(prefix, holder.owning());
+}
+
 /// Mount a pack that is already in memory - mapped, or `@embedFile`d. The
 /// bytes must outlive the mount.
 pub fn mountPackBytes(
@@ -174,6 +199,7 @@ pub fn unmount(self: *Vfs, io: Io, id: Id) void {
         if (mount_at.owns_prefix) self.gpa.free(mount_at.prefix);
         // Ordered, because the order is what "the last mount wins" means.
         _ = self.mounts.orderedRemove(i);
+        self.generation += 1;
         return;
     }
 }
@@ -236,6 +262,48 @@ pub fn read(
         };
     }
     return error.FileNotFound;
+}
+
+/// `path` as a stream, for an asset too big to want whole. The caller closes
+/// it. See `Stream`.
+pub fn open(self: *Vfs, io: Io, gpa: Allocator, path: []const u8) Error!*Stream {
+    var buf: [vpath.max_len]u8 = undefined;
+    const name = try vpath.normalize(&buf, path, self.rules);
+
+    var i = self.mounts.items.len;
+    while (i > 0) {
+        i -= 1;
+        const mount_at = self.mounts.items[i];
+        const under = beneath(mount_at.prefix, name) orelse continue;
+        return mount_at.source.open(io, gpa, under) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => err,
+        };
+    }
+    return error.FileNotFound;
+}
+
+/// `read`, started now and finished when the caller asks.
+///
+/// ```zig
+/// var pending = files.readAsync(io, gpa, "levels/two.bin", .limited(1 << 26));
+/// ... // the frame goes on
+/// const bytes = try pending.await(io);
+/// ```
+///
+/// This is `std.Io`'s `async`, so what it actually does is the Io
+/// implementation's business: a threaded one reads on another thread, a
+/// blocking one reads right here and `await` finds the answer waiting. The
+/// mount table may be read from any number of these at once; it may not be
+/// mounted or unmounted while one is in flight. `path` must outlive the await.
+pub fn readAsync(
+    self: *Vfs,
+    io: Io,
+    gpa: Allocator,
+    path: []const u8,
+    limit: Io.Limit,
+) Io.Future(Error![]u8) {
+    return io.async(read, .{ self, io, gpa, path, limit });
 }
 
 /// Every path any mount has that `glob` matches, each one once, sorted. An

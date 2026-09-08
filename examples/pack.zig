@@ -3,6 +3,7 @@
 //! The packer. Run it with `zig build pack -- <command> ...`.
 //!
 //!   `create <pack> <directory>`   put a directory into a pack
+//!   `update <pack> <directory>`   put a directory over an existing pack
 //!   `list <pack>`                 what is in one, and what it cost
 //!   `extract <pack> <directory>`  take it back out
 //!
@@ -32,7 +33,7 @@ const Options = struct {
     /// without a decompressor.
     store: bool = false,
 
-    const Command = enum { create, list, extract };
+    const Command = enum { create, update, list, extract };
 
     fn fromArguments(init: std.process.Init, arena: std.mem.Allocator) !?Options {
         const arguments = try init.minimal.args.toSlice(arena);
@@ -78,6 +79,7 @@ pub fn main(init: std.process.Init) !void {
 
     switch (options.command) {
         .create => try create(gpa, io, out, options),
+        .update => try update(gpa, io, out, options),
         .list => try list(gpa, io, out, options),
         .extract => try extract(gpa, io, out, options),
     }
@@ -150,6 +152,60 @@ fn how(path: []const u8, store_everything: bool) vfs.Pack.Builder.How {
         if (std.ascii.endsWithIgnoreCase(path, extension)) return .store;
     }
     return .auto;
+}
+
+// -------------------------------------------------------------------------
+// update
+// -------------------------------------------------------------------------
+
+fn update(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, options: Options) !void {
+    var files: vfs.Vfs = .init(gpa);
+    defer files.deinit(io);
+    _ = try files.mountDir(io, "", options.directory, .{});
+
+    const found = try files.list(io, gpa, options.glob);
+    defer {
+        for (found) |path| gpa.free(path);
+        gpa.free(found);
+    }
+
+    // The old pack is read while the new one is written, so the new one goes
+    // to a file beside it and takes its place only once it is whole.
+    var old: vfs.Pack = try .openFile(gpa, io, options.pack, .{});
+    defer old.deinit(io);
+
+    const staging = try std.mem.concat(gpa, u8, &.{ options.pack, ".new" });
+    defer gpa.free(staging);
+    var replaced: usize = 0;
+    {
+        var file = try Io.Dir.cwd().createFile(io, staging, .{});
+        defer file.close(io);
+        var buffer: [64 * 1024]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+
+        // Everything the old pack had is carried as it was stored; what the
+        // directory has replaces what it names, and nothing else moves.
+        var builder: vfs.Pack.Builder = try .initFrom(gpa, &writer.interface, &old, io);
+        defer builder.deinit();
+
+        for (found) |path| {
+            const bytes = try files.read(io, gpa, path, .limited(1 << 30));
+            defer gpa.free(bytes);
+            if (old.find(path) != null) replaced += 1;
+            try builder.remove(path);
+            try builder.add(path, bytes, how(path, options.store));
+        }
+        try builder.finish();
+        try writer.interface.flush();
+    }
+    try Io.Dir.cwd().rename(staging, Io.Dir.cwd(), options.pack, io);
+
+    try out.print("{s}: {d} replaced, {d} added, {d} carried\n", .{
+        options.pack,
+        replaced,
+        found.len - replaced,
+        old.entries().len - replaced,
+    });
 }
 
 // -------------------------------------------------------------------------

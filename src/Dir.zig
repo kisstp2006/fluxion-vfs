@@ -15,6 +15,11 @@
 //! `verify_case` reads the directory and insists the name on disk is spelled
 //! the way it was asked for. It costs a directory listing per component, which
 //! is why it is a debug default and not a release one.
+//!
+//! **A listing starts where the glob does.** `levels/*.txt` opens `levels` and
+//! walks from there; the rest of the tree is never touched. Only the part of
+//! the glob before its first wildcard can be used this way, so `**/*.txt`
+//! still walks everything - which is what it asked for.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -23,6 +28,7 @@ const Io = std.Io;
 
 const text = @import("fluxion_text");
 const Source = @import("Source.zig");
+const Stream = @import("Stream.zig");
 const vpath = @import("vpath.zig");
 
 const Dir = @This();
@@ -49,7 +55,7 @@ pub const Options = struct {
 
 pub const OpenError = Io.Dir.OpenError;
 
-/// Open `path` as a mount source. The handle is closed by `deinit`.
+/// Open `path` as a mount source. The handle is closed by `close`.
 pub fn open(io: Io, path: []const u8, options: Options) OpenError!Dir {
     const handle = try Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
     return .{ .handle = handle, .owns_handle = true, .options = options };
@@ -75,6 +81,7 @@ const vtable: Source.VTable = .{
     .stat = statPath,
     .read = readPath,
     .list = listPaths,
+    .open = openPath,
     .write = writePath,
     .remove = removePath,
     .deinit = null,
@@ -140,10 +147,42 @@ fn readPath(
     };
 }
 
+fn openPath(ptr: *anyopaque, io: Io, gpa: Allocator, path: []const u8) Source.Error!*Stream {
+    const self: *Dir = @ptrCast(@alignCast(ptr));
+
+    if (self.options.verify_case and !try self.caseMatches(io, path)) return error.FileNotFound;
+
+    const file = self.handle.openFile(io, path, .{}) catch |err| switch (err) {
+        error.NotDir, error.IsDir, error.BadPathName, error.NameTooLong => return error.FileNotFound,
+        else => |remaining| return remaining,
+    };
+    errdefer file.close(io);
+
+    const info = try file.stat(io);
+    if (info.kind != .file) return error.FileNotFound;
+
+    return Stream.fromFile(gpa, io, file, true, 0, info.size, info.size, .none);
+}
+
 fn listPaths(ptr: *anyopaque, io: Io, glob: []const u8, into: *Source.Listing) Source.Error!void {
     const self: *Dir = @ptrCast(@alignCast(ptr));
 
-    var walker = try self.handle.walk(into.gpa);
+    // The part of the glob with no wildcard in it names the directory the
+    // walk can start from, so `levels/*.txt` never looks at `textures`.
+    const fixed = literalPrefix(glob);
+    var start = self.handle;
+    var start_owned = false;
+    if (fixed.len != 0) {
+        start = self.handle.openDir(io, fixed, .{ .iterate = true }) catch |err| switch (err) {
+            // Nothing there, so nothing to list - not an error.
+            error.FileNotFound, error.NotDir, error.BadPathName, error.NameTooLong => return,
+            else => |remaining| return remaining,
+        };
+        start_owned = true;
+    }
+    defer if (start_owned) start.close(io);
+
+    var walker = try start.walk(into.gpa);
     defer walker.deinit();
 
     while (walker.next(io) catch |err| switch (err) {
@@ -155,15 +194,43 @@ fn listPaths(ptr: *anyopaque, io: Io, glob: []const u8, into: *Source.Listing) S
         if (entry.kind != .file) continue;
 
         // The walker reports the platform's separator; a virtual path has
-        // exactly one.
+        // exactly one. And the walk began below the mount's root, so the
+        // part it began under goes back on the front.
         var buf: [vpath.max_len]u8 = undefined;
-        if (entry.path.len > buf.len) continue;
-        const name = buf[0..entry.path.len];
-        for (entry.path, name) |from, *to| to.* = if (from == '\\') '/' else from;
+        const total = fixed.len + @intFromBool(fixed.len != 0) + entry.path.len;
+        if (total > buf.len) continue;
+        var at: usize = 0;
+        if (fixed.len != 0) {
+            @memcpy(buf[0..fixed.len], fixed);
+            buf[fixed.len] = '/';
+            at = fixed.len + 1;
+        }
+        for (entry.path, buf[at..total]) |from, *to| to.* = if (from == '\\') '/' else from;
+        const name = buf[0..total];
 
         if (glob.len != 0 and !text.pattern.matchPath(glob, name)) continue;
         try into.add(name);
     }
+}
+
+/// The leading components of `glob` that have no wildcard in them, without a
+/// trailing separator. Empty when the first component already has one.
+fn literalPrefix(glob: []const u8) []const u8 {
+    var end: usize = 0;
+    var it = text.path.components(glob);
+    while (it.next()) |component| {
+        const bytes = component.bytes;
+        if (std.mem.indexOfAny(u8, bytes, "*?[") != null) break;
+        // The component's position in the glob, found from its pointer.
+        const from = @intFromPtr(bytes.ptr) - @intFromPtr(glob.ptr);
+        end = from + bytes.len;
+    }
+    // A glob with no wildcard at all names one file; its directory is the
+    // prefix and the file name is left for the match.
+    if (end == glob.len) {
+        end = std.mem.lastIndexOfScalar(u8, glob, '/') orelse return "";
+    }
+    return glob[0..end];
 }
 
 // -------------------------------------------------------------------------
@@ -239,4 +306,22 @@ fn hasExactly(parent: Io.Dir, io: Io, name: []const u8) Source.Error!bool {
         if (std.mem.eql(u8, entry.name, name)) return true;
     }
     return false;
+}
+
+// -------------------------------------------------------------------------
+// Tests
+// -------------------------------------------------------------------------
+
+test "the part of a glob a walk can start from" {
+    try std.testing.expectEqualStrings("levels", literalPrefix("levels/*.txt"));
+    try std.testing.expectEqualStrings("levels/one", literalPrefix("levels/one/*.txt"));
+    try std.testing.expectEqualStrings("levels", literalPrefix("levels/**/*.txt"));
+    try std.testing.expectEqualStrings("", literalPrefix("**/*.txt"));
+    try std.testing.expectEqualStrings("", literalPrefix("*.txt"));
+    try std.testing.expectEqualStrings("", literalPrefix(""));
+    // A glob that is a whole file name starts in its directory.
+    try std.testing.expectEqualStrings("levels", literalPrefix("levels/one.txt"));
+    try std.testing.expectEqualStrings("", literalPrefix("one.txt"));
+    // A character class is a wildcard too.
+    try std.testing.expectEqualStrings("ui", literalPrefix("ui/[ab]*.png"));
 }

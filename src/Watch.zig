@@ -32,16 +32,20 @@
 //! none: it was built once. Paths that resolve into one are checked for having
 //! moved to another mount and otherwise cost nothing.
 //!
-//! **Polling, not the operating system's notifications.** `inotify`,
-//! `ReadDirectoryChangesW` and `FSEvents` are three different APIs with three
-//! different failure modes, none of them in `std.Io` yet, and a stat of the few
-//! hundred files a game has open during development is well under a
-//! millisecond. When `std.Io` grows a watch, this is where it goes.
+//! **Polling, with the operating system's help where it offers any.** A poll
+//! is a stat per watched path, which is well under a millisecond for the few
+//! hundred files a game has open during development and not for tens of
+//! thousands. Give the watch a `Notify` and it asks the kernel first: when
+//! nothing under any watched directory has moved and no mount has changed,
+//! the poll does nothing at all. The stats remain the source of truth for
+//! what changed and whether it has settled; the notification only says
+//! whether there is anything to look at.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
+const Notify = @import("Notify.zig");
 const Vfs = @import("Vfs.zig");
 const vpath = @import("vpath.zig");
 
@@ -54,6 +58,16 @@ changes: std.ArrayListUnmanaged(Change) = .empty,
 /// Paths reported as removed, kept alive until the poll after the one that
 /// reported them, so a `Change.path` is never a dangling pointer.
 retired: std.ArrayListUnmanaged([]const u8) = .empty,
+
+/// The kernel's word on whether anything moved, when there is one. See
+/// `useNotify`.
+notify: ?*Notify = null,
+/// The mount table's generation at the last full scan, so a mount or unmount
+/// forces one even when the kernel saw nothing.
+generation: u64 = std.math.maxInt(u64),
+/// Set when a path or glob was added, so the next poll scans whatever the
+/// kernel says.
+dirty: bool = true,
 
 /// How long a file has to hold still before a change is believed.
 ///
@@ -134,6 +148,7 @@ pub fn add(self: *Watch, path: []const u8) Error!void {
     var buf: [vpath.max_len]u8 = undefined;
     const name = try vpath.normalize(&buf, path, .portable);
     _ = try self.track(name, true);
+    self.dirty = true;
 }
 
 /// Watch everything a glob matches, including files that appear later.
@@ -146,6 +161,7 @@ pub fn addGlob(self: *Watch, glob: []const u8) Error!void {
         if (std.mem.eql(u8, existing, glob)) return;
     }
     try self.globs.append(self.gpa, try self.gpa.dupe(u8, glob));
+    self.dirty = true;
 }
 
 /// Stop watching one path. A path a glob still matches comes back on the next
@@ -159,6 +175,15 @@ pub fn forget(self: *Watch, path: []const u8) void {
         _ = self.tracked.swapRemove(i);
         return;
     }
+}
+
+/// Let the kernel say when a poll can be skipped. The `Notify` must outlive
+/// the watch, and must have been given every directory a watched path can
+/// resolve into; one it was not given is a directory whose changes are missed
+/// until a mount changes or a path is added.
+pub fn useNotify(self: *Watch, notify: *Notify) void {
+    self.notify = notify;
+    self.dirty = true;
 }
 
 /// How many paths are being watched.
@@ -183,10 +208,23 @@ pub fn poll(self: *Watch, files: *Vfs, io: Io) Error![]const Change {
 
     const now = Io.Timestamp.now(io, .awake).nanoseconds;
 
-    try self.scanGlobs(files, io);
+    // With the kernel's word that nothing moved and no mount having changed,
+    // the only paths worth a look are the ones part-way through settling.
+    var everything = self.dirty or files.generation != self.generation;
+    if (self.notify) |notify| {
+        if (notify.drain()) everything = true;
+    } else everything = true;
+    self.dirty = false;
+    self.generation = files.generation;
+
+    if (everything) try self.scanGlobs(files, io);
 
     var i: usize = 0;
     while (i < self.tracked.items.len) {
+        if (!everything and self.tracked.items[i].pending == null) {
+            i += 1;
+            continue;
+        }
         const gone = try self.check(&self.tracked.items[i], files, io, now);
         if (gone) {
             // The path is reported this poll and freed at the start of the

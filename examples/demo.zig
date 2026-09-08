@@ -86,6 +86,30 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // --- the same pack, three ways in ---------------------------------
+
+    try out.print("\n--- one asset, read three ways ---\n", .{});
+    // Whole, which is what a texture wants.
+    const whole = try files.read(io, gpa, "levels/one.txt", .limited(1 << 20));
+    try out.print("read:   {s}\n", .{whole});
+    // A piece at a time, which is what a video wants.
+    var stream = try files.open(io, gpa, "levels/one.txt");
+    defer stream.close(io);
+    const first_word = try stream.reader.takeDelimiterExclusive(',');
+    try out.print("stream: {s}... ({d} bytes in all)\n", .{ first_word, stream.size });
+    // Started now and collected later, which is what a loading screen wants.
+    var later = files.readAsync(io, gpa, "ui/panel.png", .limited(1 << 20));
+    const panel = try later.await(io);
+    try out.print("async:  {s}\n", .{panel});
+
+    if (vfs.Map.supported) {
+        // A pack mapped rather than read: opened in the time it takes to
+        // read the index, and an uncompressed entry is a slice of the file.
+        var mapped: vfs.Pack = try .map(gpa, io, pack_path, .{});
+        defer mapped.deinit(io);
+        try out.print("mapped: {s} (no copy)\n", .{mapped.slice("ui/panel.png").?});
+    }
+
     // --- hot reload -----------------------------------------------------
 
     var watch: vfs.Watch = .init(gpa);

@@ -16,6 +16,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
+const Stream = @import("Stream.zig");
+
 const Source = @This();
 
 ptr: *anyopaque,
@@ -81,6 +83,9 @@ pub const VTable = struct {
     /// An empty glob means everything.
     list: *const fn (ptr: *anyopaque, io: Io, glob: []const u8, into: *Listing) Error!void,
 
+    /// `path` as a stream, for an asset too big to want whole. See `Stream`.
+    open: *const fn (ptr: *anyopaque, io: Io, gpa: Allocator, path: []const u8) Error!*Stream,
+
     /// Put `bytes` at `path`, making whatever directories it needs. Null for
     /// a kind of source that can never be written to, whatever its options -
     /// which a pack is. See the `writable` field for the per-mount answer.
@@ -108,6 +113,10 @@ pub fn read(self: Source, io: Io, gpa: Allocator, path: []const u8, limit: Io.Li
 
 pub fn list(self: Source, io: Io, glob: []const u8, into: *Listing) Error!void {
     return self.vtable.list(self.ptr, io, glob, into);
+}
+
+pub fn open(self: Source, io: Io, gpa: Allocator, path: []const u8) Error!*Stream {
+    return self.vtable.open(self.ptr, io, gpa, path);
 }
 
 pub fn write(self: Source, io: Io, path: []const u8, bytes: []const u8) Error!void {

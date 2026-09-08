@@ -28,10 +28,19 @@
 //! blobs as they arrive and the index after them means a pack of any size is
 //! built with one entry in memory at a time.
 //!
-//! **A pack can be read from memory or from a file.** `fromBytes` is for one
-//! that is already there - mapped, or `@embedFile`d. `openFile` keeps the file
-//! open, holds only the index, and reads each entry from where it lies, which
-//! is what a multi-gigabyte pack of textures wants.
+//! **A pack can be read three ways.** `fromBytes` for one already in memory -
+//! `@embedFile`d, or held by the caller. `map` for one on disk, mapped whole
+//! and paged in as it is touched, which is the fastest way to open a large
+//! one and the only way an uncompressed entry can be handed out as a slice of
+//! the file. `openFile` for a target that cannot map, or a pack on a
+//! filesystem that will not be: the file stays open, the index is held, and
+//! each entry is read from where it lies.
+//!
+//! **Changing a pack is rewriting it.** There is no in-place update, because
+//! one would mean moving every blob after the one that changed and rewriting
+//! the index anyway. `Builder.initFrom` starts a new pack from an old one:
+//! carry every entry over, take some out, put some in, and the old pack's
+//! bytes are copied as they are - never decompressed and compressed again.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -40,7 +49,9 @@ const Io = std.Io;
 const hashing = @import("fluxion_hash");
 const fxdata = @import("fluxion_data");
 
+const Map = @import("Map.zig");
 const Source = @import("Source.zig");
+const Stream = @import("Stream.zig");
 const vpath = @import("vpath.zig");
 const glob_match = @import("fluxion_text").pattern;
 
@@ -104,9 +115,12 @@ options: Options,
 /// Owns the entries and the bytes of their paths.
 index: fxdata.Decoded(Index),
 storage: Storage,
+/// Present when `storage` is memory this pack mapped itself, and must unmap.
+mapping: ?Map = null,
 
 pub const Storage = union(enum) {
-    /// Bytes the caller owns, which must outlive the pack.
+    /// Bytes the caller owns, which must outlive the pack - or bytes of a
+    /// mapping the pack owns, when `mapping` is set.
     memory: []const u8,
     /// A file this pack opened and will close.
     owned_file: Io.File,
@@ -136,6 +150,20 @@ pub fn fromBytes(gpa: Allocator, bytes: []const u8, options: Options) Error!Pack
         .index = index,
         .storage = .{ .memory = bytes },
     };
+}
+
+/// Map a pack file into memory and read it from there.
+///
+/// The fastest way to open a large pack, and the only one on which an entry
+/// stored without compression costs no copy. `error.Unsupported` on a target
+/// with no memory mapping; `openFile` works everywhere.
+pub fn map(gpa: Allocator, io: Io, path: []const u8, options: Options) (Error || Map.Error)!Pack {
+    var mapping = try Map.open(io, path);
+    errdefer mapping.deinit();
+
+    var pack = try fromBytes(gpa, mapping.bytes, options);
+    pack.mapping = mapping;
+    return pack;
 }
 
 /// Open a pack file, keeping it open and holding only the index.
@@ -183,6 +211,7 @@ pub fn deinit(self: *Pack, io: Io) void {
         .owned_file => |file| file.close(io),
         .memory, .borrowed_file => {},
     }
+    if (self.mapping) |*mapping| mapping.deinit();
     self.* = undefined;
 }
 
@@ -195,10 +224,11 @@ const vtable: Source.VTable = .{
     .stat = statPath,
     .read = readPath,
     .list = listPaths,
+    .open = openPath,
     // A pack is written once by a tool and read many times by a game. Making
     // it writable would mean rewriting the index and moving every blob after
-    // the one that changed, which is what the loose directory mount above it
-    // is for.
+    // the one that changed, which is what `Builder.initFrom` does honestly
+    // and the loose directory mount above it avoids entirely.
     .write = null,
     .remove = null,
     .deinit = null,
@@ -248,6 +278,21 @@ pub fn find(self: *const Pack, path: []const u8) ?*const Entry {
     return null;
 }
 
+/// An uncompressed entry as a slice of the pack's own memory, with no copy.
+///
+/// Only for a pack that is in memory - `fromBytes` or `map` - and only for an
+/// entry stored as it is; null otherwise, and `read` is the general answer.
+/// The slice lives as long as the pack does. Not checksummed: the caller who
+/// wanted that would have had to read the bytes, which is what this avoids.
+pub fn slice(self: *const Pack, path: []const u8) ?[]const u8 {
+    const entry = self.find(path) orelse return null;
+    if (entry.compression != .none) return null;
+    return switch (self.storage) {
+        .memory => |bytes| bytes[@intCast(entry.offset)..][0..@intCast(entry.size)],
+        .owned_file, .borrowed_file => null,
+    };
+}
+
 fn statPath(ptr: *anyopaque, io: Io, path: []const u8) Error!?Source.Stat {
     _ = io;
     const self: *Pack = @ptrCast(@alignCast(ptr));
@@ -279,6 +324,33 @@ fn readPath(
     return out;
 }
 
+fn openPath(ptr: *anyopaque, io: Io, gpa: Allocator, path: []const u8) Error!*Stream {
+    const self: *Pack = @ptrCast(@alignCast(ptr));
+    const entry = self.find(path) orelse return error.FileNotFound;
+    const how: Stream.Compression = switch (entry.compression) {
+        .none => .none,
+        .flate => .flate,
+    };
+    return switch (self.storage) {
+        .memory => |bytes| Stream.fromMemory(
+            gpa,
+            bytes[@intCast(entry.offset)..][0..@intCast(entry.stored)],
+            entry.size,
+            how,
+        ),
+        .owned_file, .borrowed_file => |file| Stream.fromFile(
+            gpa,
+            io,
+            file,
+            false,
+            entry.offset,
+            entry.stored,
+            entry.size,
+            how,
+        ),
+    };
+}
+
 fn listPaths(ptr: *anyopaque, io: Io, glob: []const u8, into: *Source.Listing) Error!void {
     _ = io;
     const self: *Pack = @ptrCast(@alignCast(ptr));
@@ -293,37 +365,27 @@ fn take(self: *const Pack, gpa: Allocator, io: Io, entry: Entry) Error![]u8 {
     switch (entry.compression) {
         .none => {
             if (entry.stored != entry.size) return error.Corrupt;
-            switch (self.storage) {
-                .memory => |bytes| {
-                    return gpa.dupe(u8, bytes[@intCast(entry.offset)..][0..@intCast(entry.size)]);
-                },
-                .owned_file, .borrowed_file => |file| {
-                    const out = try gpa.alloc(u8, @intCast(entry.size));
-                    errdefer gpa.free(out);
-                    try readExactly(file, io, out, entry.offset);
-                    return out;
-                },
-            }
+            return self.storedBytes(gpa, io, entry);
         },
         .flate => {
-            // The stored bytes have to be somewhere before they can be
-            // inflated, so a file-backed pack pays for one copy of them.
-            var stored: []const u8 = undefined;
-            var borrowed = true;
-            switch (self.storage) {
-                .memory => |bytes| {
-                    stored = bytes[@intCast(entry.offset)..][0..@intCast(entry.stored)];
-                },
-                .owned_file, .borrowed_file => |file| {
-                    const buffer = try gpa.alloc(u8, @intCast(entry.stored));
-                    try readExactly(file, io, buffer, entry.offset);
-                    stored = buffer;
-                    borrowed = false;
-                },
-            }
-            defer if (!borrowed) gpa.free(stored);
+            const packed_bytes = try self.storedBytes(gpa, io, entry);
+            defer gpa.free(packed_bytes);
+            return inflate(gpa, packed_bytes, @intCast(entry.size));
+        },
+    }
+}
 
-            return inflate(gpa, stored, @intCast(entry.size));
+/// An entry's bytes as they are in the file, freshly allocated.
+fn storedBytes(self: *const Pack, gpa: Allocator, io: Io, entry: Entry) Error![]u8 {
+    switch (self.storage) {
+        .memory => |bytes| {
+            return gpa.dupe(u8, bytes[@intCast(entry.offset)..][0..@intCast(entry.stored)]);
+        },
+        .owned_file, .borrowed_file => |file| {
+            const out = try gpa.alloc(u8, @intCast(entry.stored));
+            errdefer gpa.free(out);
+            try readExactly(file, io, out, entry.offset);
+            return out;
         },
     }
 }
@@ -409,14 +471,25 @@ pub const Builder = struct {
     gpa: Allocator,
     out: *Io.Writer,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
+    /// Every path in `entries` and every carried one not yet removed, so a
+    /// duplicate is found in constant time whatever the pack's size.
+    seen: std.StringHashMapUnmanaged(void) = .empty,
     at: u64 = header_size,
-    finished: bool = false,
+    /// The pack this one starts from, when it starts from one.
+    carried: ?Carried = null,
+
+    const Carried = struct {
+        pack: *const Pack,
+        io: Io,
+        /// Carried entries taken out again, by path.
+        dropped: std.StringHashMapUnmanaged(void) = .empty,
+    };
 
     pub const Error = error{
         /// Two entries with the same path. Which one a lookup should find has
         /// no good answer, so it is refused at build time.
         DuplicatePath,
-    } || vpath.Error || Io.Writer.Error || Allocator.Error;
+    } || vpath.Error || Io.Writer.Error || Pack.Error;
 
     /// How to store the next entry.
     pub const How = enum {
@@ -440,9 +513,27 @@ pub const Builder = struct {
         return .{ .gpa = gpa, .out = w };
     }
 
+    /// Start a pack that carries everything in `pack` over, so that a change
+    /// to one entry does not mean rebuilding the rest from their sources.
+    ///
+    /// The carried entries' bytes are copied as they are stored - never
+    /// decompressed and compressed again - at `finish`, after whatever was
+    /// added. `remove` takes one out before it is copied; `add` of a carried
+    /// path is a duplicate until it has been removed.
+    pub fn initFrom(gpa: Allocator, w: *Io.Writer, pack: *const Pack, io: Io) Builder.Error!Builder {
+        var self = try init(gpa, w);
+        errdefer self.deinit();
+
+        for (pack.entries()) |entry| try self.seen.putNoClobber(gpa, entry.path, {});
+        self.carried = .{ .pack = pack, .io = io };
+        return self;
+    }
+
     pub fn deinit(self: *Builder) void {
         for (self.entries.items) |entry| self.gpa.free(entry.path);
         self.entries.deinit(self.gpa);
+        self.seen.deinit(self.gpa);
+        if (self.carried) |*carried| carried.dropped.deinit(self.gpa);
         self.* = undefined;
     }
 
@@ -450,10 +541,7 @@ pub const Builder = struct {
     pub fn add(self: *Builder, path: []const u8, bytes: []const u8, how: How) Builder.Error!void {
         var buf: [vpath.max_len]u8 = undefined;
         const name = try vpath.normalize(&buf, path, .portable);
-
-        for (self.entries.items) |entry| {
-            if (std.mem.eql(u8, entry.path, name)) return error.DuplicatePath;
-        }
+        if (self.seen.contains(name)) return error.DuplicatePath;
 
         var crc: hashing.Crc32 = .init();
         crc.update(bytes);
@@ -477,6 +565,8 @@ pub const Builder = struct {
 
         const owned_path = try self.gpa.dupe(u8, name);
         errdefer self.gpa.free(owned_path);
+        try self.seen.putNoClobber(self.gpa, owned_path, {});
+        errdefer _ = self.seen.remove(owned_path);
         try self.entries.append(self.gpa, .{
             .path = owned_path,
             .offset = self.at,
@@ -490,9 +580,35 @@ pub const Builder = struct {
         self.at += stored.len;
     }
 
-    /// Write the index and the offset that points at it. The builder is done
-    /// after this, and the caller flushes whatever `w` was.
+    /// Take `path` out of the pack being built.
+    ///
+    /// For a carried entry this is free: it is simply not copied. For one
+    /// added to this builder the bytes are already in the output and stay
+    /// there, unreachable - a pack rewritten to drop them is `initFrom` on the
+    /// result. Not an error when the path was never there.
+    pub fn remove(self: *Builder, path: []const u8) Builder.Error!void {
+        var buf: [vpath.max_len]u8 = undefined;
+        const name = try vpath.normalize(&buf, path, .portable);
+        if (!self.seen.remove(name)) return;
+
+        for (self.entries.items, 0..) |entry, i| {
+            if (!std.mem.eql(u8, entry.path, name)) continue;
+            self.gpa.free(entry.path);
+            _ = self.entries.orderedRemove(i);
+            return;
+        }
+        // Not added here, so it is a carried one; remember not to copy it.
+        const carried = &self.carried.?;
+        const entry = carried.pack.find(name).?;
+        try carried.dropped.put(self.gpa, entry.path, {});
+    }
+
+    /// Write the carried entries, the index, and the offset that points at
+    /// it. The builder is done after this, and the caller flushes whatever
+    /// `w` was.
     pub fn finish(self: *Builder) Builder.Error!void {
+        if (self.carried) |carried| try self.copyCarried(carried);
+
         std.mem.sort(Entry, self.entries.items, {}, byPath);
 
         const index: Index = .{ .entries = self.entries.items };
@@ -503,7 +619,26 @@ pub const Builder = struct {
         var tail: [footer_size]u8 = undefined;
         std.mem.writeInt(u64, &tail, self.at, .little);
         try self.out.writeAll(&tail);
-        self.finished = true;
+    }
+
+    /// Copy every carried entry not taken out, byte for byte as stored.
+    fn copyCarried(self: *Builder, carried: Carried) Builder.Error!void {
+        for (carried.pack.entries()) |entry| {
+            if (carried.dropped.contains(entry.path)) continue;
+
+            const stored = try carried.pack.storedBytes(self.gpa, carried.io, entry);
+            defer self.gpa.free(stored);
+
+            const owned_path = try self.gpa.dupe(u8, entry.path);
+            errdefer self.gpa.free(owned_path);
+            var moved = entry;
+            moved.path = owned_path;
+            moved.offset = self.at;
+            try self.entries.append(self.gpa, moved);
+
+            try self.out.writeAll(stored);
+            self.at += stored.len;
+        }
     }
 
     fn byPath(_: void, a: Entry, b: Entry) bool {

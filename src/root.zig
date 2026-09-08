@@ -5,7 +5,9 @@
 //!   `Vfs`     the mount table, and the verbs: read, write, list, locate
 //!   `Dir`     a directory on disk, as a source
 //!   `Pack`    one file holding many, as a source, and the tool to build one
+//!   `Stream`  an asset read a piece at a time
 //!   `Watch`   what changed since you last asked
+//!   `Notify`  the kernel's word on whether anything did, so a poll can be skipped
 //!   `Source`  what any of the above is, so a game can add its own
 //!   `vpath`   what a virtual path is, and what it is not
 //!
@@ -51,7 +53,10 @@ pub const Vfs = @import("Vfs.zig");
 pub const Dir = @import("Dir.zig");
 pub const Pack = @import("Pack.zig");
 pub const Watch = @import("Watch.zig");
+pub const Notify = @import("Notify.zig");
 pub const Source = @import("Source.zig");
+pub const Stream = @import("Stream.zig");
+pub const Map = @import("Map.zig");
 pub const vpath = @import("vpath.zig");
 
 /// Everything a mount table can answer with. See `Source.Error` and
@@ -74,7 +79,11 @@ test {
     _ = Dir;
     _ = Pack;
     _ = Watch;
+    _ = Notify;
     _ = Source;
+    _ = Stream;
+    _ = Map;
     _ = vpath;
     _ = @import("vfs_test.zig");
+    _ = @import("later_test.zig");
 }
