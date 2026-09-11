@@ -7,20 +7,20 @@
     .fingerprint = 0x258b9ff295ad612f,
     .dependencies = .{
         .fluxion_text = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-text#5d87f1578401d35c0b9881d2c678ef56c4ceccd4",
+            .url = "git+https://github.com/kisstp2006/fluxion-text#41010ffb170fb13a72cc1751ee6031f8d1eebb6f",
             .hash = "fluxion_text-0.1.0-cIhfioG2AgAJJ9hB0dOMWhHvk6ConZmD0OTreG41NoLX",
         },
         .fluxion_hash = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-hash#3260ac0d478e025a143e2ef9094c1bf72a932868",
+            .url = "git+https://github.com/kisstp2006/fluxion-hash#d7211dc2a0e961a67ffb070f45e6089b8125069c",
             .hash = "fluxion_hash-0.1.0-Zu520_IkAQCn0T4xz2CCSD724jkXcbzZBb_dFirBrjS2",
         },
         .fluxion_data = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-data#7e743d4992f38cd4306987f815e482e8ff7bb6a0",
-            .hash = "fluxion_data-0.1.0-kueVImYWAQA_3QibWNa_ijStnbVzEBuJaw8sRbLHLM_T",
+            .url = "git+https://github.com/kisstp2006/fluxion-data#557814e008630aaa8ce0ad16c827dc2d611cd991",
+            .hash = "fluxion_data-0.1.0-kueVImYWAQBpTFeRZoHiJcM-QVba7bvciQsX38RklrNm",
         },
         .fluxion_jobs = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-jobs#e064fb3129f9324b139d7ecbcf75cbd99787dad9",
-            .hash = "fluxion_jobs-0.1.0-FBQYG6HWAAD3RZ_geJ6O5O0UmfH666aT_-DuMCVqJiN1",
+            .url = "git+https://github.com/kisstp2006/fluxion-jobs#92f1340ffcea225567ffb1564b00d276b88fd11f",
+            .hash = "fluxion_jobs-0.1.0-FBQYG6HWAABfncwNFYncNPBVrvx_i16S7Yd-Q6bpvCUW",
         },
     },
     .paths = .{
