@@ -270,8 +270,10 @@ const Linux = struct {
     gpa: Allocator,
     fd: i32 = -1,
     /// Each watch descriptor and the directory it stands for, so a directory
-    /// created under a watched one can be watched too.
-    dirs: std.AutoHashMapUnmanaged(i32, []const u8) = .empty,
+    /// created under a watched one can be watched too. The path keeps its
+    /// sentinel: inotify wants a C string, and an allocator frees a slice by
+    /// the length it handed out, which for a sentinel slice is one more.
+    dirs: std.AutoHashMapUnmanaged(i32, [:0]const u8) = .empty,
 
     const linux = std.os.linux;
 
