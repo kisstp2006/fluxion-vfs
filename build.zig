@@ -7,7 +7,6 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const text = b.dependency("fluxion_text", .{ .target = target, .optimize = optimize });
-    const hash = b.dependency("fluxion_hash", .{ .target = target, .optimize = optimize });
     const data = b.dependency("fluxion_data", .{ .target = target, .optimize = optimize });
     const jobs = b.dependency("fluxion_jobs", .{ .target = target, .optimize = optimize });
 
@@ -19,7 +18,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "fluxion_text", .module = text.module("fluxion_text") },
-            .{ .name = "fluxion_hash", .module = hash.module("fluxion_hash") },
             .{ .name = "fluxion_data", .module = data.module("fluxion_data") },
             .{ .name = "fluxion_jobs", .module = jobs.module("fluxion_jobs") },
         },

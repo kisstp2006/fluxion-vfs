@@ -97,6 +97,7 @@ zig build pack -- update assets.fxpk patch      # carry everything, replace what
 zig build pack -- list assets.fxpk
 zig build pack -- extract assets.fxpk out
 zig build pack -- create assets.fxpk assets --jobs 0   # one thread, for comparison
+zig build pack -- create assets.fxpk assets --key 64-hex-digits   # sealed
 ```
 
 A pack is built once by a tool and read many times by a game, which is what
@@ -106,10 +107,15 @@ and lets a watch skip it entirely.
 ```
 FXPK                 four bytes, so a file that is not one is noticed at once
 version              one byte: the container's own
-flags                one byte, none in use yet
-reserved             two bytes of zero, to keep the blobs eight-aligned
-blobs                every entry's bytes, in the order they were added
+flags                one byte: sealed, hidden, signed
+reserved             two bytes of zero
+salt                 sixteen bytes the keys of a sealed pack are drawn with
+key check            sixteen bytes that tell a wrong key from a damaged pack
+reserved             eight bytes of zero, to keep the blobs sixteen-aligned
+blobs                every entry's chunks, in the order they were added
 index                a fluxion-data document holding the entries
+index tag            sixteen bytes: the index's seal, zero when it is in the clear
+signature            sixty-four bytes over header, index and tag, zero when unsigned
 index offset         eight bytes, little endian: the last eight in the file
 ```
 
@@ -131,19 +137,53 @@ on every load is not worth the bytes, and a stored entry can be read straight
 out of a mapped pack. The tool stores `.png`, `.ogg` and the rest of the
 already-compressed extensions without trying.
 
-**Every entry carries a CRC-32 of the bytes that come out**, not of the ones
-that went in, so a pack whose compressor was buggy is caught as well as one
-whose disk is. Checked on every `read` unless you turn it off.
+**An entry is stored in chunks of 64 KiB**, each compressed on its own and
+each with a check in the index: the first half of the SHA-256 of its stored
+bytes, checked on every read unless you turn it off. A stream works one chunk
+out at a time, so it holds 64 KiB however large the entry, and a damaged chunk
+stops it where it lies.
+
+**A sealed pack keeps its contents from anyone without the key.** Every chunk
+is AES-256-GCM, and its tag is its check. The nonce is the entry's number and
+the chunk's, and the entry's path is associated data, so a chunk cannot be
+moved within an entry or to another one without the seal breaking. The key you
+give is never used as it is: the pack draws its own keys from it and the salt
+with HKDF, so no two packs share one, and a sixteen-byte key check in the
+header tells `error.WrongKey` from damage. A **hidden** pack seals its index
+too, so not even the names can be read; `Builder.Seal.hide_index` is on by
+default.
+
+```zig
+var salt: [16]u8 = undefined;
+io.random(&salt);
+var builder: vfs.Pack.Builder = try .init(gpa, &out, .{ .seal = .{ .key = key, .salt = salt } });
+// ...
+var pack: vfs.Pack = try .openFile(gpa, io, "assets.fxpk", .{ .key = key });
+```
+
+**A signed pack can be refused once it has changed.** `Builder.Options.sign`
+takes an Ed25519 key pair and signs the header, the index and the index's tag.
+The index holds every chunk's check, so the signature covers every byte, and a
+reader given `Options.signed_by` refuses a pack that anyone without the private
+key has touched with `error.NotSigned`.
+
+None of this keeps a pack from the program that opens it: the key has to be
+wherever the pack is read. Sealing keeps the contents from archive tools and
+casual copying, not from someone who takes the key out of that program.
 
 **A pack can be opened three ways.** `map` maps the file whole and lets the
 kernel page it in as it is touched - the fastest open for a large pack, and
-the only way an uncompressed entry can be handed out as a slice of the file
-with no copy, which is `Pack.slice`. `openFile` keeps the file open, holds the
-index, and reads each entry from where it lies, for a target that cannot map.
-`fromBytes` is for a pack already in memory, `@embedFile`d or otherwise.
+the only way an entry stored in the clear and uncompressed can be handed out as
+a slice of the file with no copy, which is `Pack.slice`. `openFile` keeps the
+file open, holds the index, and reads each entry from where it lies, for a
+target that cannot map. `fromBytes` is for a pack already in memory,
+`@embedFile`d or otherwise. `fromFileRegion`, and `Vfs.mountPackRegion`, open a
+pack that is only part of a file: one written onto the end of a program, or
+stored as it is inside an archive. Every offset in a pack is 64 bits, so a
+pack of its own has no size limit.
 
-**A pack is built on every core.** Deflating is nearly the whole cost of
-building one and each entry is independent of every other, so `Builder.addAll`
+**A pack is built on every core.** Deflating and sealing are nearly the whole
+cost of building one and each entry is independent of every other, so `Builder.addAll`
 prepares them on a [Fluxion Jobs](https://github.com/kisstp2006/fluxion-jobs)
 scheduler and writes them in order afterwards. The pack is byte for byte the
 one `add` in a loop would have written - the tests check exactly that, against
@@ -164,8 +204,8 @@ costs what reading the files costs and nothing more.
 
 **Changing a pack is rebuilding it**, and `Builder.initFrom` makes that cheap:
 it starts a new pack from an old one, carries every entry across as it was
-stored - never decompressed and compressed again - and lets you take some out
-and put some in. What it will not do is pretend to update in place, because
+stored - never decompressed and compressed again, and between two seals only
+opened and sealed again - and lets you take some out and put some in. What it will not do is pretend to update in place, because
 that would mean moving every blob after the one that changed and rewriting the
 index anyway.
 
@@ -246,11 +286,9 @@ exe_mod.addImport("fluxion_vfs", fluxion.module("fluxion_vfs"));
 const vfs = @import("fluxion_vfs");
 ```
 
-Four dependencies come with it, fetched the same way and needing nothing from
+Three dependencies come with it, fetched the same way and needing nothing from
 you: [Fluxion Text](https://github.com/kisstp2006/fluxion-text) for path
 normalizing and glob matching,
-[Fluxion Hash](https://github.com/kisstp2006/fluxion-hash) for the CRC-32 on
-every pack entry,
 [Fluxion Data](https://github.com/kisstp2006/fluxion-data) for the pack index
 and the schema fingerprint that dates it, and
 [Fluxion Jobs](https://github.com/kisstp2006/fluxion-jobs) for building a pack
@@ -260,7 +298,7 @@ a scheduler with no workers makes it a plain loop.
 ## Where it sits
 
 The third tier of the Fluxion licence ladder: `BSD-2-Clause`, built on one
-tier-one library and three tier-two ones. That tier asks one thing a binary
+tier-one library and two tier-two ones. That tier asks one thing a binary
 built from it did not before - the copyright notice reproduced in the
 documentation or about-box of what you ship.
 
@@ -271,15 +309,21 @@ Everything else needs a real disk or a real pack: paths a mount table must
 refuse, shadowing between mounts, a listing that is a set rather than a
 concatenation, a save that has nowhere to go, a stream read seven bytes at a
 time from every kind of place, a mapped entry checked to be inside the
-mapping, a rebuilt pack whose carried entry kept its stored size and checksum,
+mapping, a rebuilt pack whose carried entry kept its stored size and checks,
 a pack of six hundred entries built three ways - one at a time, on every core,
 and on none - and compared byte for byte, and a watch that hears about a write
 through the kernel.
 
 The pack tests are mostly about what a pack is not - a wrong magic, a version
 from the future, a flag this build does not know, an index offset past the end
-of the file, an index of a different shape, a flipped byte caught by the CRC
-and the same byte not caught when the check is turned off. The watch tests
+of the file, an index of a different shape, a flipped byte caught by the check
+and the same byte not caught when the check is turned off. The sealed ones are
+about what a pack gives away: no contents and no names without the key, a
+missing key and a wrong one told apart, a flipped bit and two swapped chunks
+that each still carry a good seal both refused, a signature that fails for
+another signer, an unsigned pack and a changed index, a pack read out of the
+middle of a larger file, and a pack rebuilt under a new seal and under none,
+still deflated. The watch tests
 drive the settle window from both sides: a change held back for an hour, and
 the same change reported once when the wait is over.
 

@@ -136,7 +136,7 @@ test "two entries with the same name have no right answer" {
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    var builder: Pack.Builder = try .init(gpa, &out.writer);
+    var builder: Pack.Builder = try .init(gpa, &out.writer, .{});
     defer builder.deinit();
 
     try builder.add("ui/a.png", "one", .store);
@@ -159,7 +159,7 @@ test "a file that is not a pack, and one from a build that is not this one" {
     try testing.expectError(error.UnsupportedPack, Pack.fromBytes(gpa, bent, .{}));
     bent[4] = Pack.format_version;
 
-    bent[5] = 1; // a flag this build does not know the meaning of
+    bent[5] = 0x80; // a flag this build does not know the meaning of
     try testing.expectError(error.UnsupportedPack, Pack.fromBytes(gpa, bent, .{}));
     bent[5] = 0;
 
@@ -178,9 +178,10 @@ test "an index whose entries are a different shape" {
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    try out.writer.writeAll(&Pack.magic);
-    try out.writer.writeByte(Pack.format_version);
-    try out.writer.writeAll(&[_]u8{ 0, 0, 0 });
+    var head = [_]u8{0} ** Pack.header_size;
+    head[0..4].* = Pack.magic;
+    head[4] = Pack.format_version;
+    try out.writer.writeAll(&head);
     try out.writer.writeAll("a"); // one byte of blob
 
     const at = Pack.header_size + 1;
@@ -190,9 +191,9 @@ test "an index whose entries are a different shape" {
     defer gpa.free(index);
     try out.writer.writeAll(index);
 
-    var tail: [8]u8 = undefined;
-    std.mem.writeInt(u64, &tail, at, .little);
-    try out.writer.writeAll(&tail);
+    var foot = [_]u8{0} ** Pack.footer_size;
+    std.mem.writeInt(u64, foot[Pack.footer_size - 8 ..][0..8], at, .little);
+    try out.writer.writeAll(&foot);
 
     try testing.expectError(error.UnsupportedPack, Pack.fromBytes(gpa, out.written(), .{}));
 }
@@ -218,6 +219,247 @@ test "a byte that changed after the pack was written" {
     const got = try unchecked_source.read(io, gpa, "a.txt", one_mb);
     defer gpa.free(got);
     try testing.expect(!std.mem.eql(u8, "hello there", got));
+}
+
+// -------------------------------------------------------------------------
+// Sealing and signing
+// -------------------------------------------------------------------------
+
+const key_a: Pack.Key = [_]u8{0xA1} ** 32;
+const key_b: Pack.Key = [_]u8{0xB2} ** 32;
+const salt_one = [_]u8{1} ** 16;
+const salt_two = [_]u8{2} ** 16;
+
+/// Bytes that do not compress, `len` of them.
+fn noiseOf(len: usize, seed: u64) ![]u8 {
+    const bytes = try gpa.alloc(u8, len);
+    var prng: std.Random.DefaultPrng = .init(seed);
+    prng.random().bytes(bytes);
+    return bytes;
+}
+
+test "a sealed pack gives nothing away without its key" {
+    const noise = try noiseOf(Pack.chunk_len * 2 + 123, 11);
+    defer gpa.free(noise);
+    const long_text = compressible ** 12; // several chunks, deflated
+
+    const built = try Pack.buildWith(gpa, .{ .seal = .{ .key = key_a, .salt = salt_one } }, &.{
+        .{ .path = "secret/notes.txt", .bytes = compressible },
+        .{ .path = "secret/noise.bin", .bytes = noise, .how = .store },
+        .{ .path = "secret/long.txt", .bytes = long_text, .how = .deflate },
+        .{ .path = "secret/empty.txt", .bytes = "" },
+    });
+    defer gpa.free(built);
+
+    // Neither the contents nor, with the index hidden, the names.
+    try testing.expect(std.mem.indexOf(u8, built, "the same sentence") == null);
+    try testing.expect(std.mem.indexOf(u8, built, "secret/") == null);
+
+    try testing.expectError(error.KeyNeeded, Pack.fromBytes(gpa, built, .{}));
+    try testing.expectError(error.WrongKey, Pack.fromBytes(gpa, built, .{ .key = key_b }));
+
+    var pack: Pack = try .fromBytes(gpa, built, .{ .key = key_a });
+    defer pack.deinit(io);
+    var source = pack.source();
+    for ([_]struct { path: []const u8, want: []const u8 }{
+        .{ .path = "secret/notes.txt", .want = compressible },
+        .{ .path = "secret/noise.bin", .want = noise },
+        .{ .path = "secret/long.txt", .want = long_text },
+        .{ .path = "secret/empty.txt", .want = "" },
+    }) |item| {
+        const got = try source.read(io, gpa, item.path, .unlimited);
+        defer gpa.free(got);
+        try testing.expectEqualSlices(u8, item.want, got);
+
+        // And a piece at a time, which opens one chunk at a time.
+        var stream = try source.open(io, gpa, item.path);
+        defer stream.close(io);
+        var pieced: std.ArrayListUnmanaged(u8) = .empty;
+        defer pieced.deinit(gpa);
+        while (true) {
+            const piece = stream.reader.take(1000) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            try pieced.appendSlice(gpa, piece);
+        }
+        const rest = try stream.reader.allocRemaining(gpa, .unlimited);
+        defer gpa.free(rest);
+        try pieced.appendSlice(gpa, rest);
+        try testing.expectEqualSlices(u8, item.want, pieced.items);
+    }
+
+    // A sealed entry is never handed out as a slice of the pack.
+    try testing.expect(pack.slice("secret/noise.bin") == null);
+}
+
+test "a sealed pack can leave its names in the clear" {
+    const built = try Pack.buildWith(gpa, .{ .seal = .{ .key = key_a, .salt = salt_one, .hide_index = false } }, &.{
+        .{ .path = "levels/one.json", .bytes = compressible },
+    });
+    defer gpa.free(built);
+
+    try testing.expect(std.mem.indexOf(u8, built, "levels/one.json") != null);
+    try testing.expect(std.mem.indexOf(u8, built, "the same sentence") == null);
+
+    var pack: Pack = try .fromBytes(gpa, built, .{ .key = key_a });
+    defer pack.deinit(io);
+    var source = pack.source();
+    const got = try source.read(io, gpa, "levels/one.json", one_mb);
+    defer gpa.free(got);
+    try testing.expectEqualStrings(compressible, got);
+}
+
+test "a sealed chunk that changed or moved does not open" {
+    const noise = try noiseOf(Pack.chunk_len * 3, 12);
+    defer gpa.free(noise);
+
+    const built = try Pack.buildWith(gpa, .{ .seal = .{ .key = key_a, .salt = salt_one } }, &.{
+        .{ .path = "a.bin", .bytes = noise, .how = .store },
+    });
+    defer gpa.free(built);
+    const bent = try gpa.dupe(u8, built);
+    defer gpa.free(bent);
+
+    // One bit, anywhere in a chunk.
+    bent[Pack.header_size + 5000] ^= 1;
+    {
+        var pack: Pack = try .fromBytes(gpa, bent, .{ .key = key_a });
+        defer pack.deinit(io);
+        var source = pack.source();
+        try testing.expectError(error.Corrupt, source.read(io, gpa, "a.bin", one_mb));
+    }
+
+    // Two whole chunks swapped: each is a good seal, in the wrong place.
+    @memcpy(bent, built);
+    const first = bent[Pack.header_size..][0..Pack.chunk_len];
+    const second = bent[Pack.header_size + Pack.chunk_len ..][0..Pack.chunk_len];
+    const held = try gpa.dupe(u8, first);
+    defer gpa.free(held);
+    @memcpy(first, second);
+    @memcpy(second, held);
+    {
+        var pack: Pack = try .fromBytes(gpa, bent, .{ .key = key_a });
+        defer pack.deinit(io);
+        var source = pack.source();
+        try testing.expectError(error.Corrupt, source.read(io, gpa, "a.bin", one_mb));
+    }
+}
+
+test "a signed pack is refused by a reader that trusts someone else, or once changed" {
+    const ours = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic([_]u8{7} ** 32);
+    const theirs = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic([_]u8{8} ** 32);
+    const trusted = ours.public_key.toBytes();
+
+    for ([_]?Pack.Builder.Seal{ null, .{ .key = key_a, .salt = salt_one } }) |seal| {
+        const signed = try Pack.buildWith(gpa, .{ .seal = seal, .sign = ours }, &.{
+            .{ .path = "a.txt", .bytes = compressible },
+        });
+        defer gpa.free(signed);
+        const by_someone_else = try Pack.buildWith(gpa, .{ .seal = seal, .sign = theirs }, &.{
+            .{ .path = "a.txt", .bytes = compressible },
+        });
+        defer gpa.free(by_someone_else);
+        const unsigned = try Pack.buildWith(gpa, .{ .seal = seal }, &.{
+            .{ .path = "a.txt", .bytes = compressible },
+        });
+        defer gpa.free(unsigned);
+
+        var pack: Pack = try .fromBytes(gpa, signed, .{ .key = key_a, .signed_by = trusted });
+        defer pack.deinit(io);
+        var source = pack.source();
+        const got = try source.read(io, gpa, "a.txt", one_mb);
+        defer gpa.free(got);
+        try testing.expectEqualStrings(compressible, got);
+
+        try testing.expectError(error.NotSigned, Pack.fromBytes(gpa, by_someone_else, .{ .key = key_a, .signed_by = trusted }));
+        try testing.expectError(error.NotSigned, Pack.fromBytes(gpa, unsigned, .{ .key = key_a, .signed_by = trusted }));
+
+        // A byte of the index changed, as a patched check would be.
+        const bent = try gpa.dupe(u8, signed);
+        defer gpa.free(bent);
+        const at = std.mem.readInt(u64, signed[signed.len - 8 ..][0..8], .little);
+        bent[@intCast(at + 3)] ^= 1;
+        try testing.expectError(error.NotSigned, Pack.fromBytes(gpa, bent, .{ .key = key_a, .signed_by = trusted }));
+
+        // A reader that trusts nobody reads a signed pack like any other.
+        var anyone: Pack = try .fromBytes(gpa, signed, .{ .key = key_a });
+        anyone.deinit(io);
+    }
+}
+
+test "a pack that is only part of a file, as one written onto a program" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const built = try Pack.buildWith(gpa, .{ .seal = .{ .key = key_a, .salt = salt_one } }, &.{
+        .{ .path = "a.txt", .bytes = "inside" },
+        .{ .path = "b.txt", .bytes = compressible },
+    });
+    defer gpa.free(built);
+
+    const before = "a program of its own " ** 50;
+    const after = "and something written after it";
+    const whole = try std.mem.concat(gpa, u8, &.{ before, built, after });
+    defer gpa.free(whole);
+    try put(tmp.dir, "game.exe", whole);
+
+    const file = try tmp.dir.openFile(io, "game.exe", .{});
+    defer file.close(io);
+    var pack: Pack = try .fromFileRegion(gpa, io, file, before.len, built.len, .{ .key = key_a });
+    defer pack.deinit(io);
+    var source = pack.source();
+    const got = try source.read(io, gpa, "b.txt", one_mb);
+    defer gpa.free(got);
+    try testing.expectEqualStrings(compressible, got);
+
+    // Mounted the same way, owning the file.
+    var files: Vfs = .init(gpa);
+    defer files.deinit(io);
+    const owned = try tmp.dir.openFile(io, "game.exe", .{});
+    _ = files.mountPackRegion(io, "", owned, true, before.len, built.len, .{ .key = key_a }) catch |err| {
+        owned.close(io);
+        return err;
+    };
+    try expectFile(&files, "a.txt", "inside");
+}
+
+test "a rebuilt pack can take another seal, or none" {
+    const noise = try noiseOf(Pack.chunk_len + 77, 13);
+    defer gpa.free(noise);
+
+    const old = try Pack.buildWith(gpa, .{ .seal = .{ .key = key_a, .salt = salt_one } }, &.{
+        .{ .path = "keep.txt", .bytes = compressible ** 3, .how = .deflate },
+        .{ .path = "noise.bin", .bytes = noise, .how = .store },
+    });
+    defer gpa.free(old);
+    var before: Pack = try .fromBytes(gpa, old, .{ .key = key_a });
+    defer before.deinit(io);
+
+    for ([_]?Pack.Builder.Seal{ .{ .key = key_b, .salt = salt_two }, null }) |seal| {
+        var out: Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        var builder: Pack.Builder = try .initFrom(gpa, &out.writer, .{ .seal = seal }, &before, io);
+        defer builder.deinit();
+        try builder.add("new.txt", "brand new", .store);
+        try builder.finish();
+
+        if (seal != null) {
+            try testing.expectError(error.WrongKey, Pack.fromBytes(gpa, out.written(), .{ .key = key_a }));
+        }
+        var after: Pack = try .fromBytes(gpa, out.written(), .{ .key = key_b });
+        defer after.deinit(io);
+
+        // Still deflated: opened and sealed again, never inflated.
+        try testing.expectEqual(Pack.Compression.flate, after.find("keep.txt").?.compression);
+        var source = after.source();
+        const kept = try source.read(io, gpa, "keep.txt", one_mb);
+        defer gpa.free(kept);
+        try testing.expectEqualStrings(compressible ** 3, kept);
+        const moved = try source.read(io, gpa, "noise.bin", one_mb);
+        defer gpa.free(moved);
+        try testing.expectEqualSlices(u8, noise, moved);
+    }
 }
 
 test "an entry bigger than the caller will take" {

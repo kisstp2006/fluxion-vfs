@@ -57,6 +57,14 @@ pub const Error = error{
     /// A pack this build does not know how to read: the wrong magic, a
     /// container version from the future, or an index whose schema has moved.
     UnsupportedPack,
+    /// A sealed pack, opened without a key.
+    KeyNeeded,
+    /// A sealed pack, opened with a key that is not the one it was sealed
+    /// with.
+    WrongKey,
+    /// A pack that is not signed by the key the reader was told to trust:
+    /// unsigned, or changed since it was signed.
+    NotSigned,
 } || Io.File.OpenError ||
     Io.File.ReadPositionalError ||
     Io.File.WritePositionalError ||

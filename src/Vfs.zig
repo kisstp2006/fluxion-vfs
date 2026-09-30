@@ -190,6 +190,29 @@ pub fn mountPackBytes(
     return self.mount(prefix, holder.owning());
 }
 
+/// Mount a pack that is `len` bytes of `file` from `start` on - one written
+/// onto the end of a program, or stored as it is inside an archive. The mount
+/// closes `file` when `owned` says so; until this returns, it is the caller's.
+pub fn mountPackRegion(
+    self: *Vfs,
+    io: Io,
+    prefix: []const u8,
+    file: Io.File,
+    owned: bool,
+    start: u64,
+    len: u64,
+    options: Pack.Options,
+) Error!Id {
+    const holder = try self.gpa.create(Pack);
+    errdefer self.gpa.destroy(holder);
+    holder.* = try Pack.fromFileRegion(self.gpa, io, file, start, len, options);
+    errdefer holder.deinit(io);
+
+    const id = try self.mount(prefix, holder.owning());
+    holder.storage.file.owned = owned;
+    return id;
+}
+
 /// Take a mount back out, closing whatever it owned. Unknown ids are ignored,
 /// so unmounting twice is not an error.
 pub fn unmount(self: *Vfs, io: Io, id: Id) void {

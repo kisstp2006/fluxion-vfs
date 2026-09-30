@@ -172,7 +172,7 @@ test "a pack rebuilt from another carries what it had, as it was stored" {
 
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var builder: Pack.Builder = try .initFrom(gpa, &out.writer, &before, io);
+    var builder: Pack.Builder = try .initFrom(gpa, &out.writer, .{}, &before, io);
     defer builder.deinit();
 
     // A carried path is taken, until it is removed.
@@ -195,7 +195,7 @@ test "a pack rebuilt from another carries what it had, as it was stored" {
     const kept_after = after.find("keep.txt").?.*;
     try testing.expectEqual(kept_before.compression, kept_after.compression);
     try testing.expectEqual(kept_before.stored, kept_after.stored);
-    try testing.expectEqual(kept_before.checksum, kept_after.checksum);
+    try testing.expectEqualSlices(Pack.Chunk, kept_before.chunks, kept_after.chunks);
 
     var source = after.source();
     for ([_]struct { path: []const u8, want: []const u8 }{
@@ -374,7 +374,7 @@ fn freeCorpus(items: []Pack.Builder.Item) void {
 fn buildOneAtATime(items: []const Pack.Builder.Item) ![]u8 {
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var builder: Pack.Builder = try .init(gpa, &out.writer);
+    var builder: Pack.Builder = try .init(gpa, &out.writer, .{});
     defer builder.deinit();
     for (items) |item| try builder.add(item.path, item.bytes, item.how);
     try builder.finish();
@@ -388,7 +388,7 @@ fn buildOnJobs(items: []const Pack.Builder.Item, options: Jobs.Options) ![]u8 {
 
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var builder: Pack.Builder = try .init(gpa, &out.writer);
+    var builder: Pack.Builder = try .init(gpa, &out.writer, .{});
     defer builder.deinit();
     try builder.addAll(&jobs, items);
     try builder.finish();
@@ -447,7 +447,7 @@ test "a duplicate is still refused, and nothing after it is written" {
 
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var builder: Pack.Builder = try .init(gpa, &out.writer);
+    var builder: Pack.Builder = try .init(gpa, &out.writer, .{});
     defer builder.deinit();
 
     try testing.expectError(error.DuplicatePath, builder.addAll(&jobs, &.{
@@ -471,7 +471,7 @@ test "adding none of them is not an error" {
 
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var builder: Pack.Builder = try .init(gpa, &out.writer);
+    var builder: Pack.Builder = try .init(gpa, &out.writer, .{});
     defer builder.deinit();
     try builder.addAll(&jobs, &.{});
     try builder.finish();
@@ -495,7 +495,7 @@ test "a rebuilt pack can be filled in parallel too" {
 
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var builder: Pack.Builder = try .initFrom(gpa, &out.writer, &before, io);
+    var builder: Pack.Builder = try .initFrom(gpa, &out.writer, .{}, &before, io);
     defer builder.deinit();
 
     try builder.remove("replace.txt");

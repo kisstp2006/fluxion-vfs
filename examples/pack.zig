@@ -7,6 +7,9 @@
 //!   `list <pack>`                 what is in one, and what it cost
 //!   `extract <pack> <directory>`  take it back out
 //!
+//! With `--key` and sixty-four hex digits, `create` and `update` seal the pack
+//! and hide its index, and `list` and `extract` open one that is sealed.
+//!
 //! It is a real tool and also the shortest honest example: a pack is built by
 //! mounting a directory and reading it through the same `Vfs` a game uses, so
 //! everything the library says about paths is true of what goes in.
@@ -35,6 +38,8 @@ const Options = struct {
     /// How many worker threads compress with. Null is one per spare core;
     /// zero is this thread alone, which is what a browser build has.
     jobs: ?u32 = null,
+    /// What the pack is sealed with, or opened with.
+    key: ?vfs.Pack.Key = null,
 
     const Command = enum { create, update, list, extract };
 
@@ -57,6 +62,13 @@ const Options = struct {
             } else if (std.mem.eql(u8, argument, "--jobs")) {
                 if (i + 1 >= arguments.len) return null;
                 self.jobs = std.fmt.parseInt(u32, arguments[i + 1], 10) catch return null;
+                i += 1;
+            } else if (std.mem.eql(u8, argument, "--key")) {
+                if (i + 1 >= arguments.len) return null;
+                var key: vfs.Pack.Key = undefined;
+                const decoded = std.fmt.hexToBytes(&key, arguments[i + 1]) catch return null;
+                if (decoded.len != key.len) return null;
+                self.key = key;
                 i += 1;
             } else if (std.mem.startsWith(u8, argument, "-")) {
                 return null;
@@ -104,6 +116,7 @@ fn usage(out: *Io.Writer) !void {
         \\  --glob <pattern>   only paths matching it, `**` spanning components
         \\  --store            no compression, for a pack meant to be mapped
         \\  --jobs <n>         compress on n threads; 0 for this one alone
+        \\  --key <hex>        seal with, or open with, these 32 bytes
         \\
     );
 }
@@ -179,6 +192,14 @@ fn flush(
     try builder.addAll(jobs, batch.items);
 }
 
+/// A sealed pack when there is a key, with a salt of its own.
+fn buildOptions(io: Io, options: Options) vfs.Pack.Builder.Options {
+    const key = options.key orelse return .{};
+    var salt: [16]u8 = undefined;
+    io.random(&salt);
+    return .{ .seal = .{ .key = key, .salt = salt } };
+}
+
 fn startJobs(gpa: std.mem.Allocator, io: Io, options: Options) !vfs.Jobs {
     return vfs.Jobs.init(gpa, .{
         .io = io,
@@ -213,7 +234,7 @@ fn create(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, options: Options) !vo
     var buffer: [64 * 1024]u8 = undefined;
     var writer = file.writer(io, &buffer);
 
-    var builder: vfs.Pack.Builder = try .init(gpa, &writer.interface);
+    var builder: vfs.Pack.Builder = try .init(gpa, &writer.interface, buildOptions(io, options));
     defer builder.deinit();
 
     const raw = try feed(gpa, io, &files, &builder, &jobs, found, options, null, null);
@@ -256,7 +277,7 @@ fn update(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, options: Options) !vo
 
     // The old pack is read while the new one is written, so the new one goes
     // to a file beside it and takes its place only once it is whole.
-    var old: vfs.Pack = try .openFile(gpa, io, options.pack, .{});
+    var old: vfs.Pack = try .openFile(gpa, io, options.pack, .{ .key = options.key });
     defer old.deinit(io);
 
     const staging = try std.mem.concat(gpa, u8, &.{ options.pack, ".new" });
@@ -273,7 +294,7 @@ fn update(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, options: Options) !vo
 
         // Everything the old pack had is carried as it was stored; what the
         // directory has replaces what it names, and nothing else moves.
-        var builder: vfs.Pack.Builder = try .initFrom(gpa, &writer.interface, &old, io);
+        var builder: vfs.Pack.Builder = try .initFrom(gpa, &writer.interface, buildOptions(io, options), &old, io);
         defer builder.deinit();
 
         _ = try feed(gpa, io, &files, &builder, &jobs, found, options, &replaced, &old);
@@ -295,7 +316,7 @@ fn update(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, options: Options) !vo
 // -------------------------------------------------------------------------
 
 fn list(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, options: Options) !void {
-    var pack: vfs.Pack = try .openFile(gpa, io, options.pack, .{});
+    var pack: vfs.Pack = try .openFile(gpa, io, options.pack, .{ .key = options.key });
     defer pack.deinit(io);
 
     var raw: u64 = 0;
@@ -323,7 +344,7 @@ fn extract(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, options: Options) !v
 
     var files: vfs.Vfs = .init(gpa);
     defer files.deinit(io);
-    _ = try files.mountPack(io, "", options.pack, .{});
+    _ = try files.mountPack(io, "", options.pack, .{ .key = options.key });
     // The destination is mounted too, so writing goes through the same rules
     // that reading did - including the ones about what a name may be.
     _ = try files.mountDir(io, "out", options.directory, .{ .writable = true });
