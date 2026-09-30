@@ -25,5 +25,6 @@
         "src",
         "examples",
         "README.md",
+        "LICENSE",
     },
 }
