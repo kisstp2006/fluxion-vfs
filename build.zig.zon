@@ -11,8 +11,8 @@
             .hash = "fluxion_text-0.1.0-cIhfioG2AgAJJ9hB0dOMWhHvk6ConZmD0OTreG41NoLX",
         },
         .fluxion_data = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-data#af4b36a010e920ca87a02aead63cfe6aaa657e9e",
-            .hash = "fluxion_data-0.1.0-kueVIu8kAQAE-W83QSvvVyVKgHIK2zdnWJhNQMmauzvp",
+            .url = "git+https://github.com/kisstp2006/fluxion-data#ac176aa87989b98afa398d9559539483c7876b59",
+            .hash = "fluxion_data-0.1.0-kueVIlUtAQBTCrcL2OGAu2nVHcAwazIQTjbE16bLhquh",
         },
         .fluxion_jobs = .{
             .url = "git+https://github.com/kisstp2006/fluxion-jobs#92f1340ffcea225567ffb1564b00d276b88fd11f",
